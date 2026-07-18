@@ -1,0 +1,8 @@
+# Secrets — real API keys live here; never commit
+.env
+
+# Runtime lead data (may contain personal data once integrations are live)
+data/leads.csv
+
+# OS / editor noise
+.DS_Store

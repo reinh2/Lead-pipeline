@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: up down dev fmt vet test test-race check compose-config demo-lead demo-lead-hot logs
+.PHONY: up down dev fmt vet test test-race check compose-config release-check demo-lead demo-lead-hot logs
 
 up:
 	$(COMPOSE) up -d --build
@@ -32,6 +32,9 @@ check:
 
 compose-config:
 	$(COMPOSE) config --quiet
+
+release-check: check compose-config
+	@echo "Release checks passed."
 
 logs:
 	$(COMPOSE) logs -f pipeline

@@ -4,6 +4,7 @@
 !.env.example
 
 # Service account credentials
+secrets/
 service-account*.json
 *service-account*.json
 *credentials*.json

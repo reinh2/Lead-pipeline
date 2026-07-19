@@ -52,7 +52,7 @@ func (c Card) PlainText() string {
 		fmt.Fprintf(&b, "  %s\n", l)
 	}
 	fmt.Fprintf(&b, "  Lead: %s  Deal: %s\n", c.LeadID, c.DealID)
-	fmt.Fprintf(&b, "  [ ✅ Claim ]   [ 🗑 Mark spam ]\n")
+	fmt.Fprintf(&b, "  [ ✅ Claim ]   [ 🗑 Mark spam ]   [ 💬 Contact ]\n")
 	return b.String()
 }
 

@@ -72,7 +72,7 @@ make demo-lead-hot         # «подписан оффер, переезжаю �
 make demo-lead             # обычный лид «интервьюируюсь»
 ```
 
-Открыть в браузере: <http://localhost:8080> — на лендинге заполнить форму и нажать «Send enquiry».
+Открыть в браузере: <http://localhost:8080> — на лендинге заполнить форму и нажать «Send enquiry». Не открывайте `landing/index.html` двойным кликом: адрес `file:///...` не может обратиться к API.
 
 Логи в реальном времени:
 
@@ -155,7 +155,7 @@ go run ./cmd/pipeline
 # сервис слушает :8081, пишет CSV в ../data/leads.csv
 ```
 
-Отдельно в другом терминале можно открыть лендинг напрямую как файл (`landing/index.html`) — но тогда форма не сможет достучаться до `/api/leads` из-за CORS. Проще всего для UI-правок оставить `make up` и открывать <http://localhost:8080>, а Go-сервис перезапускать через:
+Для UI-правок оставьте `make up` и открывайте <http://localhost:8080>. Открытый напрямую файл `landing/index.html` не сможет достучаться до `/api/leads`. Go-сервис можно перезапускать через:
 
 ```bash
 docker compose restart pipeline
@@ -305,49 +305,56 @@ HUBSPOT_TOKEN=pat-eu1-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
 
 Перед включением создайте custom properties: `lead_id`, `qualification`, `source`, `claimed_by` (для Deal) и `nationality`, `consent_version`, `consent_timestamp` (для Contact). Повторная доставка ищет Deal по `lead_id`, обновляет его и не создаёт дубль; Contact по-прежнему ищется по email.
 
-### 4. Google Sheets (запасной CRM)
+### 4. Google Sheets (лёгкая CRM)
 
-Хорошо, если HubSpot у вас пока нет, а видеть лиды нужно.
+Хорошо, если HubSpot у вас пока нет, а вести лиды уже нужно. Сервис создаёт **одну строку на лида**: повторная обработка обновляет эту строку, а кнопки менеджера в Telegram меняют `status`, `assigned_to` и `updated_at`.
 
-**Шаг 1. Создать таблицу.**
+#### Быстрый способ — Apps Script, без карты и Google Cloud
 
-- Google Sheets → создать новую таблицу «Anker Leads».
-- Первая вкладка → переименовать в `Leads`.
-- В первой строке создайте точную CSV-шапку: `lead_id, created_at, source, name, email, nationality, current_country, service, move_date, family_size, job_offer, message, gdpr_consent, consent_version, consented_at, category, urgency, estimate_min_eur, estimate_max_eur, summary, status`. Сервис проверяет её до первой записи.
-- Из URL достать spreadsheet id: `https://docs.google.com/spreadsheets/d/<ID>/edit`.
+**Шаг 1.** Создайте Google Sheet «Anker Leads». В меню таблицы откройте **Extensions → Apps Script**.
 
-**Шаг 2. Service account.**
+**Шаг 2.** Удалите код-заглушку и вставьте содержимое файла [`scripts/google-sheets-crm.gs`](scripts/google-sheets-crm.gs). Вверху скрипта вставьте ID таблицы из её URL (фрагмент между `/d/` и `/edit`). Скрипт сам создаст вкладку `CRM` и шапку при первом лиде.
 
-- Google Cloud Console → создать проект (или взять существующий).
-- APIs & Services → Enable APIs → включить **Google Sheets API**.
-- IAM & Admin → Service Accounts → Create service account → имя `anker-sheets`.
-- В созданном аккаунте вкладка Keys → Add key → JSON → сохранить файл, например как `secrets/sheets_sa.json`.
-
-**Шаг 3. Дать доступ.**
-
-- Открыть JSON — там `client_email` вида `anker-sheets@<project>.iam.gserviceaccount.com`.
-- В Google Sheets нажать Share → добавить этот email с правами Editor.
-
-**Шаг 4. `.env`:**
-
-```env
-SHEETS_SPREADSHEET_ID=1AbCd...
-SHEETS_SA_JSON=/run/secrets/sheets_sa.json
-SHEETS_TAB=Leads
-```
-
-**Шаг 5. Подмонтировать ключ read-only.** Не меняйте основной compose-файл. Используйте готовый overlay:
+**Шаг 3.** В первой строке скрипта замените `replace-with-a-long-random-secret` на случайный секрет. Его можно сгенерировать в терминале:
 
 ```bash
-SHEETS_SA_FILE="$PWD/secrets/sheets_sa.json" \
-  docker compose -f docker-compose.yml -f docker-compose.sheets.yml up -d
+openssl rand -hex 24
 ```
 
-В `.env` укажите `SHEETS_SA_JSON=/run/secrets/sheets_sa.json`.
+**Шаг 4.** В Apps Script нажмите **Deploy → New deployment → Web app**. Выберите:
 
-**Шаг 6.** Перезапуск, логи: `crm: google_sheets`. `make demo-lead-hot` → в таблице появляется новая строка. Sheets — append-only экспорт; изменение статуса хранится в CSV fallback.
+- **Execute as:** Me;
+- **Who has access:** Anyone.
 
-Важно: если задан и `HUBSPOT_TOKEN`, и `SHEETS_SPREADSHEET_ID` — приоритет у HubSpot. Sheets срабатывает только когда HubSpot не сконфигурирован.
+Нажмите Deploy, подтвердите разрешения Google и скопируйте URL, который оканчивается на `/exec`. Не используйте тестовый URL с `/dev`.
+
+**Шаг 5.** В `.env` вставьте URL и тот же секрет:
+
+```env
+SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/…/exec
+SHEETS_WEBHOOK_SECRET=ваш_случайный_секрет
+```
+
+Оставьте `HUBSPOT_TOKEN`, `SHEETS_SPREADSHEET_ID` и `SHEETS_SA_JSON` пустыми.
+
+**Шаг 6.** Перезапустите обычным способом — Docker overlay и JSON-ключ не нужны:
+
+```bash
+make down
+make up
+```
+
+**Шаг 7. Проверка.** В логах должна быть строка `crm: google_sheets_webhook`. Выполните `make demo-lead-hot` — появится вкладка `CRM` с одним лидом. Нажмите **Claim lead** в Telegram: в строке сменятся `status=claimed`, `assigned_to=@ваш_username` и `updated_at`. **Mark spam** поставит `status=spam`.
+
+У веб-приложения открытый URL, поэтому секрет обязателен: не отправляйте его в чат и не коммитьте `.env`. Он защищает таблицу от чужих запросов.
+
+Полезные поля в таблице: `category` — оценка AI (`hot`, `warm`, `cold`, `spam`), `urgency` — срочность от 1 до 5, `status` — этап работы менеджера (`new`, `claimed`, `spam`), `assigned_to` — кто забрал лид. CSV в `data/leads.csv` остаётся резервной историей всех событий, а не рабочей таблицей менеджера.
+
+#### Продвинутый способ — Service Account
+
+Старый вариант с `SHEETS_SPREADSHEET_ID` и `SHEETS_SA_JSON` сохранён для серверного развёртывания, где нельзя публиковать Apps Script web app. Он требует Google Cloud и JSON-ключ; для локального портфолио-проекта используйте вариант выше.
+
+Важно: если задан `HUBSPOT_TOKEN`, приоритет у HubSpot. Затем идёт Apps Script webhook, затем Service Account, затем CSV.
 
 ### 5. SMTP — авто-ответ по email
 
@@ -470,7 +477,7 @@ docker compose logs pipeline | grep qualified
 | Кнопки в Telegram не работают | нужен long-poll — убедитесь, что сервис не остановлен; вебхуков в этой сборке нет |
 | `qualifier ... fallback=true` | OpenRouter недоступен / модель невалидная — проверьте `OPENROUTER_MODEL` в каталоге |
 | В HubSpot дубли контактов | не должно быть — дедуп идёт по email, проверьте, что email нормализован (сервис делает `TrimSpace + ToLower`) |
-| В Google Sheets тишина | проверьте, что service account поделён с таблицей как Editor, что путь `SHEETS_SA_JSON` подмонтирован в контейнер, и что Sheets API включён в GCP-проекте |
+| В Google Sheets тишина | `make logs` должен содержать `crm: google_sheets_webhook`; проверьте URL с `/exec`, совпадение секрета в `.env` и Apps Script, затем сделайте новый deployment после изменения скрипта |
 
 ---
 

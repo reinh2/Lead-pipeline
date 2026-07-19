@@ -112,4 +112,4 @@ Go 1.22 (только стандартная библиотека — `net/http`
 cd pipeline && go test ./...   # race-тесты гоняются в CI на каждый push
 ```
 
-Структура проекта, диаграммы и проектные решения: [ARCHITECTURE.md](ARCHITECTURE.md). Русскоязычное руководство по запуску и настройке: [USAGE.md](USAGE.md). Планы: [ROADMAP.md](ROADMAP.md).
+Структура проекта, диаграммы и проектные решения: [ARCHITECTURE.md](ARCHITECTURE.md). Русскоязычное руководство по запуску и настройке: [USAGE.md](USAGE.md).

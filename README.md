@@ -112,4 +112,4 @@ Go 1.22 (standard library only — `net/http`, `slog`, no frameworks) · static 
 cd pipeline && go test ./...   # race-detector tests run in CI on every push
 ```
 
-Project layout, diagrams and design decisions: [ARCHITECTURE.md](ARCHITECTURE.md). Russian-language setup and configuration guide: [USAGE.md](USAGE.md). Roadmap: [ROADMAP.md](ROADMAP.md).
+Project layout, diagrams and design decisions: [ARCHITECTURE.md](ARCHITECTURE.md). Russian-language setup and configuration guide: [USAGE.md](USAGE.md).

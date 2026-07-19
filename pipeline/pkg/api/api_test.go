@@ -26,7 +26,7 @@ func (s *recordingSubmitter) Accept(_ context.Context, lead models.Lead) error {
 func baseLead() models.Lead {
 	return models.Lead{
 		Name: "Alex", Email: "alex@example.com", Nationality: "Canadian",
-		Service: models.ServiceFullRelocation, FamilySize: 2, GDPRConsent: true,
+		Service: models.ServiceFullRelocation, MoveDate: time.Now().UTC().AddDate(1, 0, 0).Format(time.DateOnly), FamilySize: 2, GDPRConsent: true,
 	}
 }
 
@@ -53,6 +53,19 @@ func TestValidate_BadEmail(t *testing.T) {
 	}
 }
 
+func TestValidate_TelegramContactWithoutEmail(t *testing.T) {
+	l := baseLead()
+	l.Email = ""
+	l.TelegramUsername = "relocating_alex"
+	if err := ValidateWebLead(l); err != nil {
+		t.Fatalf("Telegram contact should be accepted: %v", err)
+	}
+	l.TelegramUsername = "not valid"
+	if err := ValidateWebLead(l); err == nil {
+		t.Fatal("invalid Telegram username should be rejected")
+	}
+}
+
 func TestValidate_BadService(t *testing.T) {
 	l := baseLead()
 	l.Service = "chauffeur"
@@ -66,6 +79,22 @@ func TestValidate_FamilySize(t *testing.T) {
 	l.FamilySize = 0
 	if err := ValidateWebLead(l); err == nil {
 		t.Fatal("want family_size error")
+	}
+}
+
+func TestValidate_MoveDate(t *testing.T) {
+	for name, moveDate := range map[string]string{
+		"missing":   "",
+		"malformed": "2007-26-10",
+		"past":      "2020-01-01",
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := baseLead()
+			l.MoveDate = moveDate
+			if err := ValidateWebLead(l); err == nil {
+				t.Fatalf("move_date %q should be rejected", moveDate)
+			}
+		})
 	}
 }
 

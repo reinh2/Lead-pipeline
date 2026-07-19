@@ -186,7 +186,7 @@ go test -race ./...
 
 - Добавить безопасное монтирование service-account JSON в Docker Compose: Docker secret или read-only bind mount.
 - Не хранить путь к ключу как неработающее значение по умолчанию без соответствующего mount.
-- Реализовать обновление статуса по `lead_id` либо честно указать, что Sheets — только append-only экспорт.
+- ✅ Реализовано: один CRM-ряд на `lead_id`; `Claim lead` и `Mark spam` обновляют `status`, `assigned_to` и `updated_at` прямо в Google Sheets.
 - Добавить проверку существования заголовков листа и понятную ошибку конфигурации.
 
 ### CSV

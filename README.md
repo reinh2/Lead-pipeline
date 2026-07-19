@@ -6,6 +6,10 @@
 
 Проект целиком запускается в **демо-режиме без API-ключей**. Чтобы включить реальные интеграции, достаточно постепенно заполнить соответствующие переменные в `.env`.
 
+## Статус релиза
+
+**v0.1.0 · release-ready demo.** Локально проверяются `make release-check`, Docker Compose и полный Go test suite с race detector. Это портфолио-проект, а не готовый публичный сервис: перед реальным запуском обязательно настройте HTTPS, хранение/удаление персональных данных и перевыпустите любые ключи, попавшие в логи.
+
 ## Конвейер
 
 ```mermaid
@@ -56,7 +60,7 @@ go run ./cmd/pipeline    # слушает :8081, использует ../data/le
 |---|---|---|
 | OpenRouter (AI-квалификация) | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Используется mock-квалификатор по ключевым словам |
 | HubSpot CRM | `HUBSPOT_TOKEN` | Используются Google Sheets, если они настроены; иначе CSV |
-| Google Sheets CRM | `SHEETS_SPREADSHEET_ID`, `SHEETS_SA_JSON` | Используется CSV |
+| Google Sheets CRM | `SHEETS_WEBHOOK_URL`, `SHEETS_WEBHOOK_SECRET` | Используется CSV |
 | Telegram-бот и уведомления менеджеру | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_MANAGER_CHAT_ID` | Уведомления выводятся в stdout, бот выключен |
 | Slack | `SLACK_WEBHOOK_URL`, `SLACK_SIGNING_SECRET` | Slack-адаптер не регистрируется |
 | SMTP-автоответ | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Исходящее письмо выводится в stdout |
@@ -111,7 +115,7 @@ sequenceDiagram
 
 - Это **demo case study**, не публичная CRM: без HTTPS, назначенного data controller и процесса удаления данных нельзя заявлять GDPR compliance.
 - Повторная доставка уведомления может дать дубль у провайдера, который не поддерживает idempotency key; событие при исчерпанных ретраях остаётся в CSV для ручной обработки.
-- Google Sheets — append-only экспорт, а не источник истины для статусов.
+- Google Sheets — лёгкая CRM для одного процесса/экземпляра, а не замена полноценной multi-user CRM с правами, воронкой и аудитом изменений. CSV всё равно хранит резервную историю событий.
 - Публикация контейнерного образа, Alertmanager rules, видео/GIF и скриншоты безопасного демо ещё не подготовлены.
 
 ## Сценарий использования
@@ -145,6 +149,12 @@ lead-pipeline/
 
 ```bash
 cd pipeline && go test ./...
+```
+
+Перед публикацией или обновлением используйте:
+
+```bash
+make release-check
 ```
 
 Покрыты: разбор JSON от квалификатора и fallback при некорректном ответе, валидация формы и согласия на обработку данных, state machine Telegram-анкеты, построение карточек уведомлений, проверка подписи Slack и интерфейс CRM через mock.

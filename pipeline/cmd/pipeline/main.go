@@ -198,13 +198,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- Primary CRM: HubSpot > Sheets > CSV --------------------------------
+	// --- Primary CRM: HubSpot > Sheets webhook > Sheets API > CSV -----------
 	var primary crm.CRM = csvSink
 	if tok := os.Getenv("HUBSPOT_TOKEN"); tok != "" {
 		primary = crm.NewHubSpot(tok, os.Getenv("HUBSPOT_PIPELINE_ID"), log)
 		log.Info("crm: hubspot")
+	} else if webhookURL := os.Getenv("SHEETS_WEBHOOK_URL"); webhookURL != "" {
+		s, err := crm.NewSheetsWebhook(webhookURL, os.Getenv("SHEETS_WEBHOOK_SECRET"), log)
+		if err != nil {
+			log.Warn("sheets webhook init failed, falling back to csv", "err", err)
+		} else {
+			primary = s
+			log.Info("crm: google_sheets_webhook")
+		}
 	} else if sid := os.Getenv("SHEETS_SPREADSHEET_ID"); sid != "" {
-		s, err := crm.NewSheets(sid, envOr("SHEETS_TAB", "Leads"), os.Getenv("SHEETS_SA_JSON"), log)
+		s, err := crm.NewSheets(sid, envOr("SHEETS_TAB", "CRM"), os.Getenv("SHEETS_SA_JSON"), log)
 		if err != nil {
 			log.Warn("sheets init failed, falling back to csv", "err", err)
 		} else {

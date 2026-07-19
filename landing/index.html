@@ -154,6 +154,11 @@
     textarea { min-height: 110px; resize: vertical; }
     input:focus, select:focus, textarea:focus { border-color: var(--blue); outline: none; background: var(--white); box-shadow: 0 0 0 3px rgba(30, 58, 107, .16); }
     .consent { display: flex; gap: .7rem; align-items: flex-start; color: rgba(19, 42, 82, .84); font-size: .82rem; font-weight: 400; line-height: 1.55; }
+    .contact-method { display: grid; gap: .55rem; }
+    .contact-method-options { display: flex; flex-wrap: wrap; gap: .65rem; }
+    .contact-option { display: inline-flex; align-items: center; gap: .42rem; margin: 0; padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 7px; color: var(--ink-2); background: var(--sand); font-size: .82rem; }
+    .contact-option input { width: auto; margin: 0; accent-color: var(--ink-2); }
+    .contact-field[hidden] { display: none; }
     .consent input { width: 17px; min-width: 17px; height: 17px; margin-top: .14rem; accent-color: var(--ink-2); }
     .consent a { color: var(--gold); text-decoration: underline; }
     .form-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
@@ -319,9 +324,9 @@
 
     <section class="section contact" id="contact"><div class="contact-shell"><div class="section-heading" data-reveal><p class="eyebrow">Demo intake</p><h2 class="display">Try the lead flow.</h2><p>Use fictional data only. The form demonstrates validation, durable storage and status feedback.</p></div>
       <form class="lead-form" id="leadForm">
-        <div class="form-row"><label>Full name<input required name="name" autocomplete="name" aria-describedby="formStatus" /></label><label>Email<input required type="email" name="email" autocomplete="email" aria-describedby="formStatus" /></label></div>
+        <div class="form-row"><label>Full name<input required name="name" autocomplete="name" aria-describedby="formStatus" /></label><div class="contact-method"><span>Preferred reply channel</span><div class="contact-method-options"><label class="contact-option"><input type="radio" name="contact_method" value="email" checked /> Email</label><label class="contact-option"><input type="radio" name="contact_method" value="telegram" /> Telegram</label></div><label id="emailField" class="contact-field">Email<input required type="email" name="email" autocomplete="email" aria-describedby="formStatus" /></label><label id="telegramField" class="contact-field" hidden>Telegram username<input type="text" name="telegram_username" autocomplete="username" placeholder="@username" aria-describedby="formStatus" disabled /></label></div></div>
         <div class="form-row"><label>Nationality<input required name="nationality" aria-describedby="formStatus" /></label><label>Current country<input required name="current_country" aria-describedby="formStatus" /></label></div>
-        <div class="form-row three"><label>Service<select required name="service" aria-describedby="formStatus"><option value="visa_only">Visa only</option><option value="apartment_only">Apartment only</option><option value="full_relocation" selected>Full relocation</option></select></label><label>Target move date<input required type="text" name="move_date" inputmode="numeric" autocomplete="off" placeholder="YYYY-MM-DD" pattern="\d{4}-\d{2}-\d{2}" title="Use the format YYYY-MM-DD" aria-describedby="formStatus" /></label><label>Family size<input required type="number" min="1" max="12" value="1" name="family_size" aria-describedby="formStatus" /></label></div>
+        <div class="form-row three"><label>Service<select required name="service" aria-describedby="formStatus"><option value="visa_only">Visa only</option><option value="apartment_only">Apartment only</option><option value="full_relocation" selected>Full relocation</option></select></label><label>Target move date<input required type="date" id="moveDate" name="move_date" autocomplete="off" aria-describedby="formStatus" /></label><label>Family size<input required type="number" min="1" max="12" value="1" name="family_size" aria-describedby="formStatus" /></label></div>
         <label>Anything else?<textarea name="message" placeholder="Job offer status, neighbourhoods you like, timing constraints…" aria-describedby="formStatus"></textarea></label>
         <label class="consent"><input required type="checkbox" name="gdpr_consent" /><span>I consent to Anker Relocation processing my personal data to reply to this enquiry. See the <a href="/privacy.html">privacy notice</a> before submitting.</span></label>
         <div class="form-footer"><button class="button button-dark" type="submit">Send enquiry <span aria-hidden="true">→</span></button><p class="form-status" id="formStatus" role="status" aria-live="polite"></p></div>
@@ -407,7 +412,27 @@
 
       const form = document.getElementById('leadForm');
       const status = document.getElementById('formStatus');
+      const moveDate = document.getElementById('moveDate');
+      const emailField = document.getElementById('emailField');
+      const telegramField = document.getElementById('telegramField');
+      const emailInput = form.elements.email;
+      const telegramInput = form.elements.telegram_username;
       const telegramCTA = document.getElementById('tg-cta');
+      if (moveDate) {
+        const now = new Date();
+        moveDate.min = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+      }
+      const setContactMethod = () => {
+        const telegram = form.elements.contact_method.value === 'telegram';
+        emailField.hidden = telegram;
+        telegramField.hidden = !telegram;
+        emailInput.disabled = telegram;
+        emailInput.required = !telegram;
+        telegramInput.disabled = !telegram;
+        telegramInput.required = telegram;
+      };
+      form.querySelectorAll('input[name="contact_method"]').forEach((input) => input.addEventListener('change', setContactMethod));
+      setContactMethod();
       fetch('/api/public-config').then((response) => response.ok ? response.json() : null).then((config) => {
         if (config && /^https:\/\/t\.me\/[A-Za-z][A-Za-z0-9_]{4,31}$/.test(config.telegram_url || '')) {
           telegramCTA.href = config.telegram_url;
@@ -416,6 +441,10 @@
       }).catch(() => {});
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
+        if (window.location.protocol === 'file:') {
+          status.textContent = 'Open this site at http://localhost:8080 — the local file cannot reach the lead API.';
+          return;
+        }
         const button = form.querySelector('button[type="submit"]');
         const defaultLabel = button.innerHTML;
         button.disabled = true;
@@ -424,6 +453,7 @@
         status.textContent = 'Sending your enquiry…';
         const data = new FormData(form);
         const payload = Object.fromEntries(data.entries());
+        delete payload.contact_method;
         payload.gdpr_consent = data.get('gdpr_consent') === 'on';
         payload.family_size = Number.parseInt(payload.family_size, 10);
         try {

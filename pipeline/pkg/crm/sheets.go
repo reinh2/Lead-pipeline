@@ -26,10 +26,9 @@ import (
 	"github.com/anker-relocation/pipeline/pkg/retry"
 )
 
-// Sheets is a thin Google Sheets adapter using a service account JSON key.
-// Signs a JWT locally (no external OAuth library), exchanges it for a bearer
-// token, then appends rows via the Sheets v4 API. Not fancy, but enough to
-// be the "second-choice CRM" in front of the CSV fallback.
+// Sheets is a lightweight Google Sheets CRM using a service account JSON key.
+// It keeps one row per lead and updates its manager status in place. The CSV
+// sink remains the durable append-only event log and fallback.
 type Sheets struct {
 	spreadsheetID string
 	tab           string
@@ -44,7 +43,30 @@ type Sheets struct {
 
 	headerMu      sync.Mutex
 	headerChecked bool
+	opMu          sync.Mutex // keeps a find-and-update sequence atomic per process
 }
+
+const (
+	sheetsDefaultTab = "CRM"
+	sheetsLastColumn = "W"
+
+	crmStatusNew     = "new"
+	crmStatusClaimed = "claimed"
+	crmStatusSpam    = "spam"
+)
+
+var sheetsHeader = []string{
+	"lead_id", "created_at", "updated_at", "source", "name", "email",
+	"nationality", "current_country", "service", "move_date", "family_size",
+	"job_offer", "message", "gdpr_consent", "consent_version", "consented_at",
+	"category", "urgency", "estimate_min_eur", "estimate_max_eur", "summary",
+	"status", "assigned_to",
+}
+
+const (
+	sheetsStatusColumn   = 21
+	sheetsAssigneeColumn = 22
+)
 
 type saKey struct {
 	ClientEmail string `json:"client_email"`
@@ -74,7 +96,7 @@ func NewSheets(spreadsheetID, tab, saPath string, log *slog.Logger) (*Sheets, er
 		return nil, fmt.Errorf("sheets service-account JSON must include client_email and private_key")
 	}
 	if tab == "" {
-		tab = "Leads"
+		tab = sheetsDefaultTab
 	}
 	return &Sheets{
 		spreadsheetID: spreadsheetID,
@@ -93,33 +115,34 @@ func (s *Sheets) Upsert(ctx context.Context, l models.Lead, q models.Qualificati
 	if err != nil {
 		return "", err
 	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	if err := s.ensureHeader(ctx, tok); err != nil {
 		return "", err
 	}
-	row := []any{
-		l.ID, l.CreatedAt.Format(time.RFC3339), string(l.Source),
-		l.Name, l.Email, l.Nationality, l.CurrentCountry,
-		string(l.Service), l.MoveDate, l.FamilySize, l.JobOffer, l.Message,
-		l.GDPRConsent, l.ConsentVersion, l.ConsentedAt.Format(time.RFC3339), string(q.Category), q.Urgency,
-		q.Estimate.Min, q.Estimate.Max, q.Summary, string(q.Category),
+
+	status, assignee := crmStatusNew, ""
+	if rowNumber, existing, found, err := s.findRow(ctx, tok, l.ID); err != nil {
+		return "", err
+	} else if found {
+		status = sheetCell(existing, sheetsStatusColumn)
+		assignee = sheetCell(existing, sheetsAssigneeColumn)
+		if status == "" {
+			status = crmStatusNew
+		}
+		if err := s.writeRow(ctx, tok, rowNumber, s.crmRow(l, q, status, assignee)); err != nil {
+			return "", err
+		}
+		return l.ID, nil
 	}
-	body := map[string]any{"values": [][]any{row}}
-	u := fmt.Sprintf(
-		"%s/v4/spreadsheets/%s/values/%s:append?valueInputOption=RAW",
-		strings.TrimRight(s.apiBaseURL, "/"),
-		url.PathEscape(s.spreadsheetID), url.PathEscape(s.tab),
-	)
-	if _, err := s.doJSON(ctx, http.MethodPost, u, tok, body); err != nil {
+	if err := s.appendRow(ctx, tok, s.crmRow(l, q, status, assignee)); err != nil {
 		return "", err
 	}
 	return l.ID, nil
 }
 
-// Sheets is an append-only export. CSV remains the source of truth for manager
-// status transitions, so these methods deliberately do not mutate old rows.
-func (s *Sheets) MarkClaimed(_ context.Context, id, manager string) error {
-	s.log.Info("sheets mark claimed (no-op)", "id", id, "manager", manager)
-	return nil
+func (s *Sheets) MarkClaimed(ctx context.Context, id, manager string) error {
+	return s.updateStatus(ctx, id, crmStatusClaimed, manager)
 }
 
 func (s *Sheets) ensureHeader(ctx context.Context, tok string) error {
@@ -142,20 +165,129 @@ func (s *Sheets) ensureHeader(ctx context.Context, tok string) error {
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("decode sheets header: %w", err)
 	}
-	if len(out.Values) == 0 || len(out.Values[0]) != len(header) {
-		return fmt.Errorf("sheets tab %q must have the expected %d-column header", s.tab, len(header))
+	if len(out.Values) == 0 || len(out.Values[0]) == 0 {
+		if err := s.writeHeader(ctx, tok); err != nil {
+			return fmt.Errorf("initialize sheets CRM header: %w", err)
+		}
+		s.headerChecked = true
+		return nil
 	}
-	for i, want := range header {
+	if len(out.Values[0]) != len(sheetsHeader) {
+		return fmt.Errorf("sheets tab %q has an incompatible header; create or rename an empty tab to %q for the CRM", s.tab, sheetsDefaultTab)
+	}
+	for i, want := range sheetsHeader {
 		if out.Values[0][i] != want {
-			return fmt.Errorf("sheets tab %q header column %d = %q, want %q", s.tab, i+1, out.Values[0][i], want)
+			return fmt.Errorf("sheets tab %q has an incompatible header at column %d; create or rename an empty tab to %q for the CRM", s.tab, i+1, sheetsDefaultTab)
 		}
 	}
 	s.headerChecked = true
 	return nil
 }
-func (s *Sheets) MarkSpam(_ context.Context, id string) error {
-	s.log.Info("sheets mark spam (no-op)", "id", id)
+
+func (s *Sheets) MarkSpam(ctx context.Context, id string) error {
+	return s.updateStatus(ctx, id, crmStatusSpam, "")
+}
+
+func (s *Sheets) updateStatus(ctx context.Context, id, status, manager string) error {
+	tok, err := s.getToken(ctx)
+	if err != nil {
+		return err
+	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if err := s.ensureHeader(ctx, tok); err != nil {
+		return err
+	}
+	rowNumber, existing, found, err := s.findRow(ctx, tok, id)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("sheets lead %q not found", id)
+	}
+	row := make([]any, len(sheetsHeader))
+	for i := range row {
+		row[i] = sheetCell(existing, i)
+	}
+	row[2] = time.Now().UTC().Format(time.RFC3339)
+	row[sheetsStatusColumn] = status
+	if status == crmStatusClaimed {
+		row[sheetsAssigneeColumn] = manager
+	} else {
+		row[sheetsAssigneeColumn] = ""
+	}
+	if err := s.writeRow(ctx, tok, rowNumber, row); err != nil {
+		return err
+	}
+	s.log.Info("sheets status updated", "id", id, "status", status, "manager", manager)
 	return nil
+}
+
+func (s *Sheets) crmRow(l models.Lead, q models.Qualification, status, assignee string) []any {
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	return []any{
+		l.ID, l.CreatedAt.Format(time.RFC3339), updatedAt, string(l.Source),
+		l.Name, l.Email, l.Nationality, l.CurrentCountry,
+		string(l.Service), l.MoveDate, l.FamilySize, l.JobOffer, l.Message,
+		l.GDPRConsent, l.ConsentVersion, l.ConsentedAt.Format(time.RFC3339),
+		string(q.Category), q.Urgency, q.Estimate.Min, q.Estimate.Max, q.Summary,
+		status, assignee,
+	}
+}
+
+func (s *Sheets) findRow(ctx context.Context, tok, id string) (int, []string, bool, error) {
+	u := s.valuesURL(s.tab + "!A:" + sheetsLastColumn)
+	body, err := s.doJSON(ctx, http.MethodGet, u, tok, nil)
+	if err != nil {
+		return 0, nil, false, fmt.Errorf("read sheets CRM rows: %w", err)
+	}
+	var out struct {
+		Values [][]string `json:"values"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, nil, false, fmt.Errorf("decode sheets CRM rows: %w", err)
+	}
+	for i := 1; i < len(out.Values); i++ { // row 1 is the header
+		if sheetCell(out.Values[i], 0) == id {
+			return i + 1, out.Values[i], true, nil
+		}
+	}
+	return 0, nil, false, nil
+}
+
+func (s *Sheets) appendRow(ctx context.Context, tok string, row []any) error {
+	u := fmt.Sprintf("%s:append?valueInputOption=RAW", s.valuesURL(s.tab))
+	_, err := s.doJSON(ctx, http.MethodPost, u, tok, map[string]any{"values": [][]any{row}})
+	return err
+}
+
+func (s *Sheets) writeHeader(ctx context.Context, tok string) error {
+	row := make([]any, len(sheetsHeader))
+	for i, value := range sheetsHeader {
+		row[i] = value
+	}
+	return s.writeRow(ctx, tok, 1, row)
+}
+
+func (s *Sheets) writeRow(ctx context.Context, tok string, rowNumber int, row []any) error {
+	rangeRef := fmt.Sprintf("%s!A%d:%s%d", s.tab, rowNumber, sheetsLastColumn, rowNumber)
+	u := s.valuesURL(rangeRef) + "?valueInputOption=RAW"
+	_, err := s.doJSON(ctx, http.MethodPut, u, tok, map[string]any{"values": [][]any{row}})
+	return err
+}
+
+func (s *Sheets) valuesURL(rangeRef string) string {
+	return fmt.Sprintf(
+		"%s/v4/spreadsheets/%s/values/%s",
+		strings.TrimRight(s.apiBaseURL, "/"), url.PathEscape(s.spreadsheetID), url.PathEscape(rangeRef),
+	)
+}
+
+func sheetCell(row []string, index int) string {
+	if index < len(row) {
+		return row[index]
+	}
+	return ""
 }
 
 func (s *Sheets) doJSON(ctx context.Context, method, u, tok string, body any) ([]byte, error) {

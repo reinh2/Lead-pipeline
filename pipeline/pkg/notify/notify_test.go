@@ -149,3 +149,83 @@ func TestTelegramDispatch_IntakeCallbackForwardsChatAndAcknowledges(t *testing.T
 		t.Fatalf("unexpected callback acknowledgement: %#v", callbackBody)
 	}
 }
+
+func TestTelegramNotifyAddsAContactButton(t *testing.T) {
+	var body struct {
+		ReplyMarkup struct {
+			InlineKeyboard [][]map[string]string `json:"inline_keyboard"`
+		} `json:"reply_markup"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottoken/sendMessage" {
+			t.Fatalf("unexpected Telegram method path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode notification: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	}))
+	defer server.Close()
+
+	tg := NewTelegram("token", -100, slog.Default())
+	tg.apiBaseURL = server.URL
+	lead := sampleLead()
+	lead.Email = "alex@example.com"
+	if err := tg.Notify(context.Background(), lead, sampleQual(), "deal-email"); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if len(body.ReplyMarkup.InlineKeyboard) != 2 {
+		t.Fatalf("button rows = %d, want action and contact rows", len(body.ReplyMarkup.InlineKeyboard))
+	}
+	button := body.ReplyMarkup.InlineKeyboard[1][0]
+	if button["text"] != "✉️ Write email" || !strings.HasPrefix(button["url"], "https://mail.google.com/mail/?") || !strings.Contains(button["url"], "to=alex%40example.com") {
+		t.Fatalf("email contact button = %#v", button)
+	}
+}
+
+func TestContactButtonForTelegramLead(t *testing.T) {
+	button := contactButton(models.Lead{Source: models.SourceTelegram, TelegramChatID: 490407716})
+	if button == nil || button["url"] != "tg://user?id=490407716" {
+		t.Fatalf("telegram contact button = %#v", button)
+	}
+}
+
+func TestContactButtonForWebTelegramUsername(t *testing.T) {
+	button := contactButton(models.Lead{Source: models.SourceWeb, TelegramUsername: "relocating_alex"})
+	if button == nil || button["url"] != "https://t.me/relocating_alex" {
+		t.Fatalf("web Telegram contact button = %#v", button)
+	}
+}
+
+func TestTelegramMarkCardKeepsContactButton(t *testing.T) {
+	var body struct {
+		ReplyMarkup struct {
+			InlineKeyboard [][]map[string]string `json:"inline_keyboard"`
+		} `json:"reply_markup"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottoken/editMessageText" {
+			t.Fatalf("unexpected Telegram method path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode card update: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	tg := NewTelegram("token", -100, slog.Default())
+	tg.apiBaseURL = server.URL
+	tg.cards["deal-1"] = cardState{
+		ChatID: -100, MessageID: 5, Text: "card",
+		ContactButton: map[string]string{"text": "💬 Write in Telegram", "url": "tg://user?id=42"},
+	}
+	if err := tg.MarkCard(context.Background(), "deal-1", "Claimed by @manager"); err != nil {
+		t.Fatalf("mark card: %v", err)
+	}
+	if len(body.ReplyMarkup.InlineKeyboard) != 1 || body.ReplyMarkup.InlineKeyboard[0][0]["url"] != "tg://user?id=42" {
+		t.Fatalf("contact button was lost after claim: %#v", body.ReplyMarkup.InlineKeyboard)
+	}
+}

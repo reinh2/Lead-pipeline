@@ -33,7 +33,7 @@ No API keys are needed: the demo uses a mock qualifier, CSV event log and stdout
 
 - This is not a real company website. All testimonials, metrics, prices and outcomes are clearly marked as demo data.
 - It is not GDPR compliant without a real privacy process, retention/deletion workflow, HTTPS and a designated data controller.
-- Google Sheets is an append-only export; CSV remains the demo fallback event log.
+- Google Sheets is a lightweight single-process CRM: one row per lead, with manager status and assignment updates. CSV remains the fallback event log.
 - Some notification providers have no idempotency key, so a retry may produce a duplicate notification. Exhausted tasks are recorded as `dead_letter:*` events.
 
 See the [Russian README](README.md) for the architecture and lead sequence diagrams, integration configuration and backup/restore commands.

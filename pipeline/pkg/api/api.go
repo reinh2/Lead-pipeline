@@ -146,15 +146,16 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name           string `json:"name"`
-		Email          string `json:"email"`
-		Nationality    string `json:"nationality"`
-		CurrentCountry string `json:"current_country"`
-		Service        string `json:"service"`
-		MoveDate       string `json:"move_date"`
-		FamilySize     int    `json:"family_size"`
-		Message        string `json:"message"`
-		GDPRConsent    bool   `json:"gdpr_consent"`
+		Name             string `json:"name"`
+		Email            string `json:"email"`
+		TelegramUsername string `json:"telegram_username"`
+		Nationality      string `json:"nationality"`
+		CurrentCountry   string `json:"current_country"`
+		Service          string `json:"service"`
+		MoveDate         string `json:"move_date"`
+		FamilySize       int    `json:"family_size"`
+		Message          string `json:"message"`
+		GDPRConsent      bool   `json:"gdpr_consent"`
 	}
 	if contentType := r.Header.Get("Content-Type"); !isJSONContentType(contentType) {
 		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
@@ -172,20 +173,21 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	lead := models.Lead{
-		Name:           strings.TrimSpace(body.Name),
-		Email:          strings.TrimSpace(strings.ToLower(body.Email)),
-		Nationality:    strings.TrimSpace(body.Nationality),
-		CurrentCountry: strings.TrimSpace(body.CurrentCountry),
-		Service:        models.Service(body.Service),
-		MoveDate:       body.MoveDate,
-		FamilySize:     body.FamilySize,
-		Message:        strings.TrimSpace(body.Message),
-		GDPRConsent:    body.GDPRConsent,
-		Source:         models.SourceWeb,
-		CreatedAt:      now,
-		ID:             NewID(),
-		ConsentVersion: ConsentVersion,
-		ConsentedAt:    now,
+		Name:             strings.TrimSpace(body.Name),
+		Email:            strings.TrimSpace(strings.ToLower(body.Email)),
+		TelegramUsername: strings.TrimPrefix(strings.TrimSpace(body.TelegramUsername), "@"),
+		Nationality:      strings.TrimSpace(body.Nationality),
+		CurrentCountry:   strings.TrimSpace(body.CurrentCountry),
+		Service:          models.Service(body.Service),
+		MoveDate:         strings.TrimSpace(body.MoveDate),
+		FamilySize:       body.FamilySize,
+		Message:          strings.TrimSpace(body.Message),
+		GDPRConsent:      body.GDPRConsent,
+		Source:           models.SourceWeb,
+		CreatedAt:        now,
+		ID:               NewID(),
+		ConsentVersion:   ConsentVersion,
+		ConsentedAt:      now,
 	}
 	if err := ValidateWebLead(lead); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -225,6 +227,9 @@ func ValidateWebLead(l models.Lead) error {
 	if err := maxRunes("email", l.Email, 254); err != nil {
 		return err
 	}
+	if err := maxRunes("telegram_username", l.TelegramUsername, 32); err != nil {
+		return err
+	}
 	if err := maxRunes("nationality", l.Nationality, 80); err != nil {
 		return err
 	}
@@ -234,11 +239,24 @@ func ValidateWebLead(l models.Lead) error {
 	if err := maxRunes("move_date", l.MoveDate, 32); err != nil {
 		return err
 	}
+	moveDate, err := time.Parse(time.DateOnly, l.MoveDate)
+	if err != nil {
+		return errors.New("move_date must be a valid date in YYYY-MM-DD format")
+	}
+	if moveDate.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return errors.New("move_date must not be in the past")
+	}
 	if err := maxRunes("message", l.Message, 4000); err != nil {
 		return err
 	}
-	if !emailRE.MatchString(l.Email) {
+	if l.Email == "" && l.TelegramUsername == "" {
+		return errors.New("email or Telegram username is required")
+	}
+	if l.Email != "" && !emailRE.MatchString(l.Email) {
 		return errors.New("valid email is required")
+	}
+	if l.TelegramUsername != "" && !telegramUsernameRE.MatchString(l.TelegramUsername) {
+		return errors.New("valid Telegram username is required")
 	}
 	if l.Nationality == "" {
 		return errors.New("nationality is required")

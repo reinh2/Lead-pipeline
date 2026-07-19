@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,9 +49,10 @@ type Telegram struct {
 }
 
 type cardState struct {
-	ChatID    int64
-	MessageID int
-	Text      string
+	ChatID        int64
+	MessageID     int
+	Text          string
+	ContactButton map[string]string
 }
 
 func NewTelegram(token string, managerChatID int64, log *slog.Logger) *Telegram {
@@ -58,9 +60,11 @@ func NewTelegram(token string, managerChatID int64, log *slog.Logger) *Telegram 
 		token:         token,
 		managerChatID: managerChatID,
 		apiBaseURL:    "https://api.telegram.org",
-		http:          &http.Client{Timeout: 10 * time.Second},
-		log:           log,
-		cards:         map[string]cardState{},
+		// getUpdates intentionally long-polls for 25 seconds, so the transport
+		// must outlive that wait. Individual requests still receive a context.
+		http:  &http.Client{Timeout: 35 * time.Second},
+		log:   log,
+		cards: map[string]cardState{},
 	}
 }
 
@@ -74,12 +78,15 @@ func (t *Telegram) Notify(ctx context.Context, l models.Lead, q models.Qualifica
 	}
 	text += "\nLead `" + l.ID + "` · Deal `" + dealID + "`"
 
-	kb := map[string]any{
-		"inline_keyboard": [][]map[string]string{{
-			{"text": "✅ Claim lead", "callback_data": "claim:" + dealID},
-			{"text": "🗑 Mark spam", "callback_data": "spam:" + dealID},
-		}},
+	rows := [][]map[string]string{{
+		{"text": "✅ Claim lead", "callback_data": "claim:" + dealID},
+		{"text": "🗑 Mark spam", "callback_data": "spam:" + dealID},
+	}}
+	contactButton := contactButton(l)
+	if contactButton != nil {
+		rows = append(rows, []map[string]string{contactButton})
 	}
+	kb := map[string]any{"inline_keyboard": rows}
 	body := map[string]any{
 		"chat_id":      t.managerChatID,
 		"text":         text,
@@ -91,7 +98,7 @@ func (t *Telegram) Notify(ctx context.Context, l models.Lead, q models.Qualifica
 		return err
 	}
 	t.mu.Lock()
-	t.cards[dealID] = cardState{ChatID: t.managerChatID, MessageID: msgID, Text: text}
+	t.cards[dealID] = cardState{ChatID: t.managerChatID, MessageID: msgID, Text: text, ContactButton: contactButton}
 	t.mu.Unlock()
 	return nil
 }
@@ -129,14 +136,47 @@ func (t *Telegram) MarkCard(ctx context.Context, dealID, footer string) error {
 		return nil
 	}
 	newText := st.Text + "\n\n_" + escapeMD(footer) + "_"
+	rows := [][]map[string]string{}
+	if st.ContactButton != nil {
+		// Keep the manager's way to contact the lead after the card is claimed.
+		rows = append(rows, []map[string]string{st.ContactButton})
+	}
 	body := map[string]any{
 		"chat_id":      st.ChatID,
 		"message_id":   st.MessageID,
 		"text":         newText,
 		"parse_mode":   "Markdown",
-		"reply_markup": map[string]any{"inline_keyboard": [][]any{}},
+		"reply_markup": map[string]any{"inline_keyboard": rows},
 	}
 	return t.call(ctx, "editMessageText", body, nil)
+}
+
+// contactButton creates a URL action that opens the manager's normal contact
+// channel. Telegram leads can be opened directly by their private chat ID;
+// web leads get a pre-addressed Gmail draft. Telegram rejects mailto: URLs in
+// inline buttons, which would otherwise prevent the entire manager card from
+// being sent.
+func contactButton(l models.Lead) map[string]string {
+	if l.Source == models.SourceTelegram && l.TelegramChatID > 0 {
+		return map[string]string{
+			"text": "💬 Write in Telegram",
+			"url":  "tg://user?id=" + strconv.FormatInt(l.TelegramChatID, 10),
+		}
+	}
+	if l.TelegramUsername != "" {
+		return map[string]string{
+			"text": "💬 Write in Telegram",
+			"url":  "https://t.me/" + l.TelegramUsername,
+		}
+	}
+	if l.Email != "" {
+		return map[string]string{
+			"text": "✉️ Write email",
+			"url": "https://mail.google.com/mail/?view=cm&fs=1&to=" + url.QueryEscape(l.Email) +
+				"&su=" + url.QueryEscape("Anker Relocation — your enquiry"),
+		}
+	}
+	return nil
 }
 
 // Poll runs a getUpdates long-poll loop and dispatches manager actions, intake
@@ -251,6 +291,11 @@ func (t *Telegram) call(ctx context.Context, method string, body any, out any) e
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.http.Do(req)
 	if err != nil {
+		if urlErr, ok := err.(*url.Error); ok {
+			// url.Error.String includes the full Bot API URL and therefore the
+			// token. Keep only the underlying network error in application logs.
+			return fmt.Errorf("telegram %s request failed: %w", method, urlErr.Err)
+		}
 		return err
 	}
 	defer resp.Body.Close()

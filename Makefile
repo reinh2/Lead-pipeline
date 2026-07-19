@@ -14,7 +14,7 @@ dev:
 	cd pipeline && go run ./cmd/pipeline
 
 fmt:
-	cd pipeline && gofmt -w $$(rg --files -g '*.go')
+	cd pipeline && gofmt -w $$(find . -type f -name '*.go' -not -path './vendor/*')
 
 vet:
 	cd pipeline && go vet ./...
@@ -26,7 +26,7 @@ test-race:
 	cd pipeline && go test -race ./...
 
 check:
-	cd pipeline && test -z "$$(gofmt -d $$(rg --files -g '*.go'))"
+	cd pipeline && test -z "$$(gofmt -d $$(find . -type f -name '*.go' -not -path './vendor/*'))"
 	cd pipeline && go vet ./...
 	cd pipeline && go test -race ./...
 

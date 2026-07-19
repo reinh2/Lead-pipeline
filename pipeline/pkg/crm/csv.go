@@ -39,8 +39,13 @@ func NewCSV(path string) (*CSV, error) {
 		}
 	} else if err != nil {
 		return nil, err
-	} else if err := c.loadLatest(); err != nil {
-		return nil, err
+	} else {
+		if err := c.migrateLegacySchema(); err != nil {
+			return nil, err
+		}
+		if err := c.loadLatest(); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -66,6 +71,15 @@ var header = []string{
 	"category", "urgency", "estimate_min_eur", "estimate_max_eur", "summary", "status",
 }
 
+// legacyHeaderV1 was written before consent metadata was added. Keeping it
+// here gives the event log an explicit, tested migration path instead of
+// making an existing demo installation fail at startup after an upgrade.
+var legacyHeaderV1 = []string{
+	"lead_id", "created_at", "source", "name", "email", "nationality", "current_country",
+	"service", "move_date", "family_size", "job_offer", "message", "gdpr_consent",
+	"category", "urgency", "estimate_min_eur", "estimate_max_eur", "summary", "status",
+}
+
 func (c *CSV) writeHeader() error {
 	f, err := os.Create(c.path)
 	if err != nil {
@@ -81,6 +95,107 @@ func (c *CSV) writeHeader() error {
 		return err
 	}
 	return f.Sync()
+}
+
+// migrateLegacySchema upgrades the only previous on-disk CSV schema. The
+// migration is intentionally conservative: it writes a complete replacement
+// first, fsyncs it, then retains the original CSV next to the active file as
+// a timestamped backup. Unknown schemas are rejected rather than guessed at.
+func (c *CSV) migrateLegacySchema() error {
+	f, err := os.Open(c.path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil {
+		return fmt.Errorf("read CSV for schema migration: %w", err)
+	}
+	if len(rows) == 0 {
+		return c.writeHeader()
+	}
+	if sameFields(rows[0], header) {
+		return nil
+	}
+	if !sameFields(rows[0], legacyHeaderV1) {
+		return fmt.Errorf("unsupported CSV header; restore from backup or migrate it manually")
+	}
+
+	migrated := make([][]string, 1, len(rows))
+	migrated[0] = append([]string(nil), header...)
+	for rowNumber, row := range rows[1:] {
+		switch len(row) {
+		case len(header):
+			// A short-lived version wrote consent values but did not update the
+			// header. The values are already in the current column positions.
+			migrated = append(migrated, append([]string(nil), row...))
+		case len(legacyHeaderV1):
+			// Older rows have no consent metadata. Preserve the historical fact
+			// by leaving the new columns empty rather than inventing values.
+			upgraded := make([]string, 0, len(header))
+			upgraded = append(upgraded, row[:13]...)
+			upgraded = append(upgraded, "", "")
+			upgraded = append(upgraded, row[13:]...)
+			migrated = append(migrated, upgraded)
+		default:
+			return fmt.Errorf("legacy CSV row %d has %d fields; expected %d or %d", rowNumber+2, len(row), len(legacyHeaderV1), len(header))
+		}
+	}
+
+	return c.replaceWithMigratedCSV(migrated)
+}
+
+func (c *CSV) replaceWithMigratedCSV(rows [][]string) error {
+	info, err := os.Stat(c.path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".leads-migration-*.csv")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		tmp.Close()
+		return err
+	}
+	w := csv.NewWriter(tmp)
+	if err := w.WriteAll(rows); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write migrated CSV: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync migrated CSV: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	backup := c.path + ".pre-consent-migration-" + time.Now().UTC().Format("20060102T150405Z") + ".bak"
+	if err := os.Rename(c.path, backup); err != nil {
+		return fmt.Errorf("backup legacy CSV: %w", err)
+	}
+	if err := os.Rename(tmpPath, c.path); err != nil {
+		return fmt.Errorf("activate migrated CSV (original kept at %s): %w", backup, err)
+	}
+	return nil
+}
+
+func sameFields(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // AppendRaw writes a lead row before qualification runs — used as the
@@ -174,6 +289,9 @@ func (c *CSV) loadLatest() error {
 	}
 	if err != nil {
 		return fmt.Errorf("read csv header: %w", err)
+	}
+	if !sameFields(head, header) {
+		return fmt.Errorf("CSV header does not match the current event-log schema")
 	}
 	index := make(map[string]int, len(head))
 	for i, name := range head {

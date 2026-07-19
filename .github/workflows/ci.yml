@@ -33,6 +33,9 @@ jobs:
             'lead_id,created_at,source,name,email,nationality,current_country,service,move_date,family_size,job_offer,message,gdpr_consent,category,urgency,estimate_min_eur,estimate_max_eur,summary,status' \
             'ld_legacy,2026-07-18T23:42:56Z,web,Legacy Lead,legacy@example.test,Canadian,Canada,full_relocation,2026-10-01,2,,Legacy migration smoke test.,true,2026-07-19,2026-07-18T23:42:56Z,warm,3,2500,6000,Needs review.,warm' \
             > data/leads.csv
+          # The service intentionally runs as non-root. Give the bind-mounted
+          # demo data directory the same write access it has in Docker Desktop.
+          chmod 777 data
       - run: docker compose up --build -d
       - name: Check landing, readiness and durable lead write
         run: |
@@ -60,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
+      - uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: .

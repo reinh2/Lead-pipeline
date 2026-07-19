@@ -6,12 +6,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/anker-relocation/pipeline/pkg/models"
 )
@@ -22,11 +27,25 @@ type Submitter interface {
 	Accept(ctx context.Context, lead models.Lead) error
 }
 
+// ErrUnavailable means the lead was durably recorded but cannot be scheduled
+// for immediate processing because the bounded demo queue is unavailable.
+var ErrUnavailable = errors.New("lead processing temporarily unavailable")
+
 type Server struct {
-	Log      *slog.Logger
-	Sub      Submitter
-	Origins  []string
-	Limiter  *rateLimiter
+	Log            *slog.Logger
+	Sub            Submitter
+	Origins        []string
+	Limiter        *rateLimiter
+	TrustedProxies []*net.IPNet
+	// Ready is optional. When supplied it verifies dependencies needed before
+	// this instance may accept traffic.
+	Ready func(context.Context) error
+	// Metrics writes Prometheus text metrics. It is a callback so the API
+	// package stays independent from the application metrics package.
+	Metrics func(io.Writer)
+	// TelegramBotUsername is an optional public bot username used only to
+	// provide the landing page's runtime Telegram link.
+	TelegramBotUsername string
 }
 
 func New(log *slog.Logger, sub Submitter, origins []string) *Server {
@@ -38,13 +57,78 @@ func New(log *slog.Logger, sub Submitter, origins []string) *Server {
 	}
 }
 
+// NewWithTrustedProxies accepts forwarded client IP headers only when the
+// direct peer belongs to one of the explicitly configured reverse-proxy CIDRs.
+func NewWithTrustedProxies(log *slog.Logger, sub Submitter, origins []string, trustedProxies []*net.IPNet) *Server {
+	s := New(log, sub, origins)
+	s.TrustedProxies = trustedProxies
+	return s
+}
+
+func ParseTrustedProxyCIDRs(raw string) ([]*net.IPNet, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	proxies := make([]*net.IPNet, 0, len(parts))
+	for _, part := range parts {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("trusted proxy CIDR %q: %w", part, err)
+		}
+		proxies = append(proxies, network)
+	}
+	return proxies, nil
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))
 	})
+	mux.HandleFunc("/readyz", s.handleReady)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/api/public-config", s.handlePublicConfig)
 	mux.HandleFunc("/api/leads", s.handleLead)
 	return s.withCORS(mux)
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.Ready != nil {
+		if err := s.Ready(r.Context()); err != nil {
+			s.Log.Warn("readiness check failed", "err", err)
+			writeErr(w, http.StatusServiceUnavailable, "service is not ready")
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	if s.Metrics == nil {
+		http.NotFound(w, nil)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	s.Metrics(w)
+}
+
+func (s *Server) handlePublicConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	username := strings.TrimPrefix(strings.TrimSpace(s.TelegramBotUsername), "@")
+	telegramURL := ""
+	if !telegramUsernameRE.MatchString(username) {
+		username = ""
+	} else {
+		telegramURL = "https://t.me/" + username
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"telegram_url": telegramURL})
 }
 
 func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +140,7 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	ip := clientIP(r)
+	ip := clientIP(r, s.TrustedProxies)
 	if !s.Limiter.allow(ip) {
 		http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
 		return
@@ -72,10 +156,21 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 		Message        string `json:"message"`
 		GDPRConsent    bool   `json:"gdpr_consent"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&body); err != nil {
+	if contentType := r.Header.Get("Content-Type"); !isJSONContentType(contentType) {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	now := time.Now().UTC()
 	lead := models.Lead{
 		Name:           strings.TrimSpace(body.Name),
 		Email:          strings.TrimSpace(strings.ToLower(body.Email)),
@@ -87,8 +182,10 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 		Message:        strings.TrimSpace(body.Message),
 		GDPRConsent:    body.GDPRConsent,
 		Source:         models.SourceWeb,
-		CreatedAt:      time.Now().UTC(),
+		CreatedAt:      now,
 		ID:             NewID(),
+		ConsentVersion: ConsentVersion,
+		ConsentedAt:    now,
 	}
 	if err := ValidateWebLead(lead); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -96,6 +193,10 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.Sub.Accept(r.Context(), lead); err != nil {
 		s.Log.Error("submit failed", "lead_id", lead.ID, "err", err)
+		if errors.Is(err, ErrUnavailable) {
+			writeErr(w, http.StatusServiceUnavailable, "lead processing temporarily unavailable")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -107,6 +208,9 @@ func (s *Server) handleLead(w http.ResponseWriter, r *http.Request) {
 // -- validation ---------------------------------------------------------------
 
 var emailRE = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
+var telegramUsernameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{4,31}$`)
+
+const ConsentVersion = "2026-07-19"
 
 func ValidateWebLead(l models.Lead) error {
 	if !l.GDPRConsent {
@@ -114,6 +218,24 @@ func ValidateWebLead(l models.Lead) error {
 	}
 	if l.Name == "" {
 		return errors.New("name is required")
+	}
+	if err := maxRunes("name", l.Name, 120); err != nil {
+		return err
+	}
+	if err := maxRunes("email", l.Email, 254); err != nil {
+		return err
+	}
+	if err := maxRunes("nationality", l.Nationality, 80); err != nil {
+		return err
+	}
+	if err := maxRunes("current_country", l.CurrentCountry, 80); err != nil {
+		return err
+	}
+	if err := maxRunes("move_date", l.MoveDate, 32); err != nil {
+		return err
+	}
+	if err := maxRunes("message", l.Message, 4000); err != nil {
+		return err
 	}
 	if !emailRE.MatchString(l.Email) {
 		return errors.New("valid email is required")
@@ -132,10 +254,17 @@ func ValidateWebLead(l models.Lead) error {
 	return nil
 }
 
+func maxRunes(field, value string, max int) error {
+	if utf8.RuneCountInString(value) > max {
+		return fmt.Errorf("%s must be at most %d characters", field, max)
+	}
+	return nil
+}
+
 // -- helpers ------------------------------------------------------------------
 
 func (s *Server) withCORS(h http.Handler) http.Handler {
-	allowAll := len(s.Origins) == 0
+	allowAll := false
 	for _, o := range s.Origins {
 		if o == "*" {
 			allowAll = true
@@ -165,17 +294,35 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
+func isJSONContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mediaType == "application/json"
+}
+
+func clientIP(r *http.Request, trustedProxies []*net.IPNet) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if i := strings.Index(v, ","); i > 0 {
-			return strings.TrimSpace(v[:i])
+	peer := net.ParseIP(host)
+	if peer != nil && isTrustedProxy(peer, trustedProxies) {
+		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+			return forwarded.String()
 		}
-		return strings.TrimSpace(v)
 	}
-	return r.RemoteAddr
+	if peer != nil {
+		return peer.String()
+	}
+	return host
+}
+
+func isTrustedProxy(ip net.IP, proxies []*net.IPNet) bool {
+	for _, proxy := range proxies {
+		if proxy.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func NewID() string {
@@ -187,31 +334,55 @@ func NewID() string {
 // -- rate limiter -------------------------------------------------------------
 
 type rateLimiter struct {
-	max    int
-	window time.Duration
-	mu     sync.Mutex
-	hits   map[string][]time.Time
+	max     int
+	window  time.Duration
+	mu      sync.Mutex
+	hits    map[string]rateBucket
+	maxKeys int
+	idleTTL time.Duration
+	calls   uint64
+}
+
+type rateBucket struct {
+	hits    []time.Time
+	touched time.Time
 }
 
 func newRateLimiter(max int, window time.Duration) *rateLimiter {
-	return &rateLimiter{max: max, window: window, hits: map[string][]time.Time{}}
+	return &rateLimiter{max: max, window: window, hits: map[string]rateBucket{}, maxKeys: 10000, idleTTL: 10 * time.Minute}
 }
 
 func (rl *rateLimiter) allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
+	rl.calls++
+	if rl.calls%64 == 0 {
+		rl.cleanup(now)
+	}
+	bucket, exists := rl.hits[key]
+	if !exists && len(rl.hits) >= rl.maxKeys {
+		return false
+	}
 	cutoff := now.Add(-rl.window)
-	fresh := rl.hits[key][:0]
-	for _, t := range rl.hits[key] {
+	fresh := bucket.hits[:0]
+	for _, t := range bucket.hits {
 		if t.After(cutoff) {
 			fresh = append(fresh, t)
 		}
 	}
 	if len(fresh) >= rl.max {
-		rl.hits[key] = fresh
+		rl.hits[key] = rateBucket{hits: fresh, touched: now}
 		return false
 	}
-	rl.hits[key] = append(fresh, now)
+	rl.hits[key] = rateBucket{hits: append(fresh, now), touched: now}
 	return true
+}
+
+func (rl *rateLimiter) cleanup(now time.Time) {
+	for key, bucket := range rl.hits {
+		if now.Sub(bucket.touched) >= rl.idleTTL {
+			delete(rl.hits, key)
+		}
+	}
 }

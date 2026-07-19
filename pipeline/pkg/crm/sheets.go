@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 
 	"github.com/anker-relocation/pipeline/pkg/models"
+	"github.com/anker-relocation/pipeline/pkg/retry"
 )
 
 // Sheets is a thin Google Sheets adapter using a service account JSON key.
@@ -32,13 +33,17 @@ import (
 type Sheets struct {
 	spreadsheetID string
 	tab           string
+	apiBaseURL    string
 	sa            saKey
 	http          *http.Client
 	log           *slog.Logger
 
-	tokMu     sync.Mutex
-	token     string
-	tokenExp  time.Time
+	tokMu    sync.Mutex
+	token    string
+	tokenExp time.Time
+
+	headerMu      sync.Mutex
+	headerChecked bool
 }
 
 type saKey struct {
@@ -48,6 +53,12 @@ type saKey struct {
 }
 
 func NewSheets(spreadsheetID, tab, saPath string, log *slog.Logger) (*Sheets, error) {
+	if strings.TrimSpace(spreadsheetID) == "" {
+		return nil, fmt.Errorf("sheets spreadsheet id is required")
+	}
+	if strings.TrimSpace(saPath) == "" {
+		return nil, fmt.Errorf("sheets service-account JSON path is required")
+	}
 	raw, err := os.ReadFile(saPath)
 	if err != nil {
 		return nil, fmt.Errorf("read sheets SA key: %w", err)
@@ -59,12 +70,16 @@ func NewSheets(spreadsheetID, tab, saPath string, log *slog.Logger) (*Sheets, er
 	if k.TokenURI == "" {
 		k.TokenURI = "https://oauth2.googleapis.com/token"
 	}
+	if k.ClientEmail == "" || k.PrivateKey == "" {
+		return nil, fmt.Errorf("sheets service-account JSON must include client_email and private_key")
+	}
 	if tab == "" {
 		tab = "Leads"
 	}
 	return &Sheets{
 		spreadsheetID: spreadsheetID,
 		tab:           tab,
+		apiBaseURL:    "https://sheets.googleapis.com",
 		sa:            k,
 		http:          &http.Client{Timeout: 10 * time.Second},
 		log:           log,
@@ -78,16 +93,20 @@ func (s *Sheets) Upsert(ctx context.Context, l models.Lead, q models.Qualificati
 	if err != nil {
 		return "", err
 	}
+	if err := s.ensureHeader(ctx, tok); err != nil {
+		return "", err
+	}
 	row := []any{
 		l.ID, l.CreatedAt.Format(time.RFC3339), string(l.Source),
 		l.Name, l.Email, l.Nationality, l.CurrentCountry,
 		string(l.Service), l.MoveDate, l.FamilySize, l.JobOffer, l.Message,
-		l.GDPRConsent, string(q.Category), q.Urgency,
-		q.Estimate.Min, q.Estimate.Max, q.Summary, "new",
+		l.GDPRConsent, l.ConsentVersion, l.ConsentedAt.Format(time.RFC3339), string(q.Category), q.Urgency,
+		q.Estimate.Min, q.Estimate.Max, q.Summary, string(q.Category),
 	}
 	body := map[string]any{"values": [][]any{row}}
 	u := fmt.Sprintf(
-		"https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s:append?valueInputOption=RAW",
+		"%s/v4/spreadsheets/%s/values/%s:append?valueInputOption=RAW",
+		strings.TrimRight(s.apiBaseURL, "/"),
 		url.PathEscape(s.spreadsheetID), url.PathEscape(s.tab),
 	)
 	if _, err := s.doJSON(ctx, http.MethodPost, u, tok, body); err != nil {
@@ -96,11 +115,42 @@ func (s *Sheets) Upsert(ctx context.Context, l models.Lead, q models.Qualificati
 	return l.ID, nil
 }
 
-// MarkClaimed / MarkSpam are best-effort no-ops for Sheets — the CSV mirror
-// already tracks status changes and the sheet is a read/search-friendly copy,
-// not a source of truth for state transitions.
+// Sheets is an append-only export. CSV remains the source of truth for manager
+// status transitions, so these methods deliberately do not mutate old rows.
 func (s *Sheets) MarkClaimed(_ context.Context, id, manager string) error {
 	s.log.Info("sheets mark claimed (no-op)", "id", id, "manager", manager)
+	return nil
+}
+
+func (s *Sheets) ensureHeader(ctx context.Context, tok string) error {
+	s.headerMu.Lock()
+	defer s.headerMu.Unlock()
+	if s.headerChecked {
+		return nil
+	}
+	u := fmt.Sprintf(
+		"%s/v4/spreadsheets/%s/values/%s",
+		strings.TrimRight(s.apiBaseURL, "/"), url.PathEscape(s.spreadsheetID), url.PathEscape(s.tab+"!1:1"),
+	)
+	body, err := s.doJSON(ctx, http.MethodGet, u, tok, nil)
+	if err != nil {
+		return fmt.Errorf("read sheets header: %w", err)
+	}
+	var out struct {
+		Values [][]string `json:"values"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("decode sheets header: %w", err)
+	}
+	if len(out.Values) == 0 || len(out.Values[0]) != len(header) {
+		return fmt.Errorf("sheets tab %q must have the expected %d-column header", s.tab, len(header))
+	}
+	for i, want := range header {
+		if out.Values[0][i] != want {
+			return fmt.Errorf("sheets tab %q header column %d = %q, want %q", s.tab, i+1, out.Values[0][i], want)
+		}
+	}
+	s.headerChecked = true
 	return nil
 }
 func (s *Sheets) MarkSpam(_ context.Context, id string) error {
@@ -109,10 +159,22 @@ func (s *Sheets) MarkSpam(_ context.Context, id string) error {
 }
 
 func (s *Sheets) doJSON(ctx context.Context, method, u, tok string, body any) ([]byte, error) {
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(b))
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, bodyReader)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -120,7 +182,7 @@ func (s *Sheets) doJSON(ctx context.Context, method, u, tok string, body any) ([
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("sheets HTTP %d: %s", resp.StatusCode, string(data))
+		return nil, &retry.HTTPStatusError{Status: resp.StatusCode, Body: truncateResponse(data)}
 	}
 	return data, nil
 }
@@ -128,7 +190,7 @@ func (s *Sheets) doJSON(ctx context.Context, method, u, tok string, body any) ([
 func (s *Sheets) getToken(ctx context.Context) (string, error) {
 	s.tokMu.Lock()
 	defer s.tokMu.Unlock()
-	if time.Now().Before(s.tokenExp.Add(-30 * time.Second)) && s.token != "" {
+	if time.Now().Before(s.tokenExp.Add(-30*time.Second)) && s.token != "" {
 		return s.token, nil
 	}
 	jwt, err := s.signJWT()
@@ -138,7 +200,10 @@ func (s *Sheets) getToken(ctx context.Context) (string, error) {
 	form := url.Values{}
 	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
 	form.Set("assertion", jwt)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.sa.TokenURI, bytes.NewBufferString(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.sa.TokenURI, bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := s.http.Do(req)
 	if err != nil {
@@ -147,7 +212,7 @@ func (s *Sheets) getToken(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("google token HTTP %d: %s", resp.StatusCode, string(data))
+		return "", &retry.HTTPStatusError{Status: resp.StatusCode, Body: truncateResponse(data)}
 	}
 	var out struct {
 		AccessToken string `json:"access_token"`
@@ -201,4 +266,10 @@ func (s *Sheets) signJWT() (string, error) {
 
 func base64URL(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
-var _ = strconv.Itoa // keep import stable across builds
+func truncateResponse(data []byte) string {
+	const max = 300
+	if len(data) > max {
+		return string(data[:max]) + "…"
+	}
+	return string(data)
+}

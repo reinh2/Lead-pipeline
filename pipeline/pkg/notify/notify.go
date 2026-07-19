@@ -19,11 +19,11 @@ type Notifier interface {
 // Card is the channel-independent view of the notification. Telegram and Slack
 // adapters render it into their own message format.
 type Card struct {
-	Emoji    string
-	Title    string
-	Lines    []string
-	DealID   string
-	LeadID   string
+	Emoji  string
+	Title  string
+	Lines  []string
+	DealID string
+	LeadID string
 }
 
 func BuildCard(l models.Lead, q models.Qualification, dealID string) Card {

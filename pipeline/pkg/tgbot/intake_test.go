@@ -3,7 +3,9 @@ package tgbot
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/anker-relocation/pipeline/pkg/models"
 	"github.com/anker-relocation/pipeline/pkg/notify"
@@ -16,82 +18,123 @@ func (f *fakeSubmitter) Accept(_ context.Context, l models.Lead) error {
 	return nil
 }
 
-// noopTG is a *notify.Telegram we can use without an actual bot token — its
-// send methods will fail HTTP-wise if invoked, but the state-machine test only
-// pokes b.Handle after monkey-patching sends. To keep this simple and
-// dependency-free, we drive the state machine directly on the Store instead
-// of going through the real Bot.Handle for the send side, and verify submit.
-func TestStateMachine_LinearWalk(t *testing.T) {
+type fakeMessenger struct {
+	messages []string
+	inline   []string
+}
+
+func (f *fakeMessenger) SendDM(_ context.Context, _ int64, text string) error {
+	f.messages = append(f.messages, text)
+	return nil
+}
+
+func (f *fakeMessenger) AnswerInline(_ context.Context, _ int64, text string, _ [][]string) error {
+	f.inline = append(f.inline, text)
+	return nil
+}
+
+func TestIntake_CallbackCompletesOneLead(t *testing.T) {
+	ctx := context.Background()
 	sub := &fakeSubmitter{}
-	// Build a bot with a nil transport; we won't call any TG send helpers because
-	// Handle sends on every step. Instead exercise it via the exposed pieces:
-	// we drive a session manually to prove the state machine transitions and
-	// that a completed session submits a lead.
-	b := New(&notify.Telegram{}, sub, slog.Default())
+	messenger := &fakeMessenger{}
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	b := newBot(messenger, sub, slog.Default(), time.Hour, time.Minute, func() time.Time { return now })
 
-	// Seed a session at first-question state as if /start had already run.
-	sess := &Session{
-		ChatID: 42,
-		Step:   StepNationality,
-		Lead: models.Lead{
-			ID: "ld_test", Source: models.SourceTelegram, TelegramChatID: 42,
-			Name: "Alex", GDPRConsent: true, Service: models.ServiceFullRelocation, FamilySize: 1,
-		},
+	b.Handle(ctx, message(42, "Alex", "/start"))
+	if got := b.store.Get(42); got == nil || got.Step != StepConsent || got.Lead.GDPRConsent {
+		t.Fatalf("/start did not create consent session: %+v", got)
 	}
-	b.store.Put(sess)
 
-	// Walk answers one by one, verifying transitions after each step.
-	answer := func(text string) {
-		s := b.store.Get(42)
-		switch s.Step {
-		case StepNationality:
-			s.Lead.Nationality = text
-			s.Step = StepJobOffer
-		case StepJobOffer:
-			s.Lead.JobOffer = normaliseJobOffer(text)
-			s.Step = StepMoveDate
-		case StepMoveDate:
-			s.Lead.MoveDate = text
-			s.Step = StepFamilySize
-		case StepFamilySize:
-			s.Lead.FamilySize = 3
-			s.Step = StepFreeText
-		case StepFreeText:
-			s.Lead.Message = text
-			s.Step = StepDone
-			_ = b.submit.Accept(context.Background(), s.Lead)
-			b.store.Delete(42)
-			return
-		}
-		b.store.Put(s)
+	b.HandleCallback(ctx, 42, "I agree")
+	b.Handle(ctx, message(42, "Alex", "Canadian"))
+
+	update := notify.Update{CallbackQuery: &notify.CallbackQuery{
+		ID:      "callback-1",
+		Data:    "intake:Yes, signed",
+		Message: &notify.Message{Chat: notify.Chat{ID: 42}},
+	}}
+	b.HandleCallback(ctx, update.CallbackQuery.Message.Chat.ID, strings.TrimPrefix(update.CallbackQuery.Data, "intake:"))
+	if got := b.store.Get(42); got == nil || got.Step != StepMoveDate || got.Lead.JobOffer != "signed" {
+		t.Fatalf("intake callback did not advance job-offer step: %+v", got)
 	}
-	answer("Canadian")
-	answer("Yes, signed offer")
-	answer("2026-09-01")
-	answer("3")
-	answer("Wife and one kid.")
+
+	b.Handle(ctx, message(42, "Alex", "2026-09-01"))
+	b.Handle(ctx, message(42, "Alex", "zero"))
+	if got := b.store.Get(42); got == nil || got.Step != StepFamilySize {
+		t.Fatalf("invalid family size advanced session: %+v", got)
+	}
+	b.Handle(ctx, message(42, "Alex", "3"))
+	b.Handle(ctx, message(42, "Alex", "done"))
 
 	if len(sub.leads) != 1 {
 		t.Fatalf("want 1 submitted lead, got %d", len(sub.leads))
 	}
-	l := sub.leads[0]
-	if l.Nationality != "Canadian" || l.JobOffer != "signed" || l.FamilySize != 3 || l.Source != models.SourceTelegram {
-		t.Fatalf("bad lead: %+v", l)
+	lead := sub.leads[0]
+	if lead.Nationality != "Canadian" || lead.JobOffer != "signed" || lead.FamilySize != 3 || !lead.GDPRConsent {
+		t.Fatalf("bad submitted lead: %+v", lead)
 	}
 	if b.store.Get(42) != nil {
 		t.Fatal("session should be cleared after submit")
 	}
 }
 
+func TestIntake_CommandsAndExpiredSession(t *testing.T) {
+	ctx := context.Background()
+	sub := &fakeSubmitter{}
+	messenger := &fakeMessenger{}
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	b := newBot(messenger, sub, slog.Default(), 10*time.Minute, time.Minute, func() time.Time { return now })
+
+	b.Handle(ctx, message(7, "Sam", "/start"))
+	b.Handle(ctx, message(7, "Sam", "/cancel"))
+	if b.store.Get(7) != nil {
+		t.Fatal("/cancel should clear the session")
+	}
+	b.Handle(ctx, message(7, "Sam", "/restart"))
+	if got := b.store.Get(7); got == nil || got.Step != StepConsent {
+		t.Fatalf("/restart did not start a new session: %+v", got)
+	}
+
+	b.store.Put(&Session{ChatID: 8, Step: StepConsent, Started: now.Add(-11 * time.Minute), UpdatedAt: now.Add(-11 * time.Minute)})
+	b.Handle(ctx, message(8, "", "I agree"))
+	if b.store.Get(8) != nil {
+		t.Fatal("expired session should be removed")
+	}
+	if got := messenger.messages[len(messenger.messages)-1]; !strings.Contains(got, "expired") {
+		t.Fatalf("want expiry explanation, got %q", got)
+	}
+}
+
+func TestIntake_DoesNotSubmitWithoutExplicitConsent(t *testing.T) {
+	ctx := context.Background()
+	sub := &fakeSubmitter{}
+	b := newBot(&fakeMessenger{}, sub, slog.Default(), time.Hour, time.Minute, time.Now)
+
+	b.Handle(ctx, message(9, "Ada", "/start"))
+	b.Handle(ctx, message(9, "Ada", "Canadian"))
+	b.Handle(ctx, message(9, "Ada", "No, cancel"))
+
+	if len(sub.leads) != 0 {
+		t.Fatalf("want no submitted leads without consent, got %d", len(sub.leads))
+	}
+	if b.store.Get(9) != nil {
+		t.Fatal("declined-consent session should be cleared")
+	}
+}
+
 func TestNormaliseJobOffer(t *testing.T) {
 	cases := map[string]string{
-		"Yes, signed": "signed",
+		"Yes, signed":                "signed",
 		"Interviewing at two places": "interviewing",
-		"No, still looking": "no",
+		"No, still looking":          "no",
 	}
 	for in, want := range cases {
 		if got := normaliseJobOffer(in); got != want {
 			t.Errorf("normaliseJobOffer(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+func message(chatID int64, firstName, text string) *notify.Message {
+	return &notify.Message{From: notify.From{FirstName: firstName}, Chat: notify.Chat{ID: chatID}, Text: text}
 }

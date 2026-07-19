@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/anker-relocation/pipeline/pkg/models"
+	"github.com/anker-relocation/pipeline/pkg/retry"
 )
 
 // CallbackAction is what the manager clicked on the notification card.
@@ -28,16 +30,21 @@ const (
 // name so the CRM can record who claimed the lead.
 type CallbackHandler func(ctx context.Context, action CallbackAction, dealID, manager string)
 
+// IntakeCallbackHandler receives the originating chat and value of an intake
+// button. It is intentionally separate from manager-card actions.
+type IntakeCallbackHandler func(ctx context.Context, chatID int64, value string)
+
 // Telegram implements Notifier and, when Poll() is running, also handles the
 // inline-button callbacks. Two roles, one bot.
 type Telegram struct {
 	token         string
 	managerChatID int64
+	apiBaseURL    string
 	http          *http.Client
 	log           *slog.Logger
 
-	mu       sync.Mutex
-	cards    map[string]cardState // dealID -> last message posted
+	mu    sync.Mutex
+	cards map[string]cardState // dealID -> last message posted
 }
 
 type cardState struct {
@@ -50,6 +57,7 @@ func NewTelegram(token string, managerChatID int64, log *slog.Logger) *Telegram 
 	return &Telegram{
 		token:         token,
 		managerChatID: managerChatID,
+		apiBaseURL:    "https://api.telegram.org",
 		http:          &http.Client{Timeout: 10 * time.Second},
 		log:           log,
 		cards:         map[string]cardState{},
@@ -131,9 +139,9 @@ func (t *Telegram) MarkCard(ctx context.Context, dealID, footer string) error {
 	return t.call(ctx, "editMessageText", body, nil)
 }
 
-// Poll runs a getUpdates long-poll loop and dispatches inline-button taps to
-// the CallbackHandler. Blocks until ctx is done.
-func (t *Telegram) Poll(ctx context.Context, onCallback CallbackHandler, onIntake IntakeHandler) {
+// Poll runs a getUpdates long-poll loop and dispatches manager actions, intake
+// buttons, and ordinary messages. Blocks until ctx is done.
+func (t *Telegram) Poll(ctx context.Context, onCallback CallbackHandler, onIntake IntakeHandler, onIntakeCallback IntakeCallbackHandler) {
 	var offset int64
 	for {
 		if ctx.Err() != nil {
@@ -141,8 +149,8 @@ func (t *Telegram) Poll(ctx context.Context, onCallback CallbackHandler, onIntak
 		}
 		body := map[string]any{"timeout": 25, "offset": offset, "allowed_updates": []string{"message", "callback_query"}}
 		var out struct {
-			OK     bool      `json:"ok"`
-			Result []Update  `json:"result"`
+			OK     bool     `json:"ok"`
+			Result []Update `json:"result"`
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := t.call(reqCtx, "getUpdates", body, &out)
@@ -160,32 +168,38 @@ func (t *Telegram) Poll(ctx context.Context, onCallback CallbackHandler, onIntak
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
 			}
-			t.dispatch(ctx, u, onCallback, onIntake)
+			t.dispatch(ctx, u, onCallback, onIntake, onIntakeCallback)
 		}
 	}
 }
 
-func (t *Telegram) dispatch(ctx context.Context, u Update, onCallback CallbackHandler, onIntake IntakeHandler) {
-	if u.CallbackQuery != nil && onCallback != nil {
-		data := u.CallbackQuery.Data
-		manager := u.CallbackQuery.From.Username
-		if manager == "" {
-			manager = u.CallbackQuery.From.FirstName
+func (t *Telegram) dispatch(ctx context.Context, u Update, onCallback CallbackHandler, onIntake IntakeHandler, onIntakeCallback IntakeCallbackHandler) {
+	if callback := u.CallbackQuery; callback != nil {
+		data := callback.Data
+		ack := "This action is no longer available."
+		switch {
+		case strings.HasPrefix(data, "claim:") && onCallback != nil:
+			manager := callback.From.Username
+			if manager == "" {
+				manager = callback.From.FirstName
+			}
+			onCallback(ctx, ActionClaim, strings.TrimPrefix(data, "claim:"), manager)
+			ack = "Got it — claim"
+		case strings.HasPrefix(data, "spam:") && onCallback != nil:
+			manager := callback.From.Username
+			if manager == "" {
+				manager = callback.From.FirstName
+			}
+			onCallback(ctx, ActionSpam, strings.TrimPrefix(data, "spam:"), manager)
+			ack = "Got it — spam"
+		case strings.HasPrefix(data, "intake:") && onIntakeCallback != nil && callback.Message != nil:
+			onIntakeCallback(ctx, callback.Message.Chat.ID, strings.TrimPrefix(data, "intake:"))
+			ack = "Answer received"
 		}
-		var action CallbackAction
-		var dealID string
-		if len(data) > 6 && data[:6] == "claim:" {
-			action, dealID = ActionClaim, data[6:]
-		} else if len(data) > 5 && data[:5] == "spam:" {
-			action, dealID = ActionSpam, data[5:]
-		} else {
-			return
-		}
-		onCallback(ctx, action, dealID, manager)
-		// Ack the button press so the client stops spinning.
+		// Ack every callback so the Telegram client never keeps the button spinner.
 		_ = t.call(ctx, "answerCallbackQuery", map[string]any{
-			"callback_query_id": u.CallbackQuery.ID,
-			"text":              "Got it — " + string(action),
+			"callback_query_id": callback.ID,
+			"text":              ack,
 		}, nil)
 		return
 	}
@@ -195,13 +209,15 @@ func (t *Telegram) dispatch(ctx context.Context, u Update, onCallback CallbackHa
 }
 
 type Update struct {
-	UpdateID      int64    `json:"update_id"`
-	Message       *Message `json:"message"`
-	CallbackQuery *struct {
-		ID   string `json:"id"`
-		From From   `json:"from"`
-		Data string `json:"data"`
-	} `json:"callback_query"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    From     `json:"from"`
+	Data    string   `json:"data"`
+	Message *Message `json:"message"`
 }
 type From struct {
 	ID        int64  `json:"id"`
@@ -211,10 +227,11 @@ type From struct {
 type Message struct {
 	MessageID int    `json:"message_id"`
 	From      From   `json:"from"`
-	Chat      struct {
-		ID int64 `json:"id"`
-	} `json:"chat"`
-	Text string `json:"text"`
+	Chat      Chat   `json:"chat"`
+	Text      string `json:"text"`
+}
+type Chat struct {
+	ID int64 `json:"id"`
 }
 
 // IntakeHandler receives ordinary user messages so the tgbot package can drive
@@ -222,23 +239,40 @@ type Message struct {
 type IntakeHandler func(ctx context.Context, m *Message)
 
 func (t *Telegram) call(ctx context.Context, method string, body any, out any) error {
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.telegram.org/bot"+t.token+"/"+method, bytes.NewReader(b))
+	b, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode telegram %s request: %w", method, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		t.apiBaseURL+"/bot"+t.token+"/"+method, bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("create telegram %s request: %w", method, err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read telegram %s response: %w", method, err)
+	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("telegram %s HTTP %d: %s", method, resp.StatusCode, string(data))
+		return &retry.HTTPStatusError{Status: resp.StatusCode, Body: truncateTelegramResponse(data)}
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
 	}
 	return nil
+}
+
+func truncateTelegramResponse(data []byte) string {
+	const max = 300
+	if len(data) > max {
+		return string(data[:max]) + "…"
+	}
+	return string(data)
 }
 
 // escapeMD escapes Telegram Markdown v1 special characters.

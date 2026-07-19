@@ -1,9 +1,14 @@
 package notify
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -60,6 +65,21 @@ func TestSlackBlocks_HasActionButtonsWithDealID(t *testing.T) {
 	}
 }
 
+func TestSlackBlocksEscapesUserControlledMrkdwn(t *testing.T) {
+	lead := sampleLead()
+	lead.Name = "<Alex & Co>"
+	lead.Nationality = "<Canadian>"
+	qual := sampleQual()
+	qual.Summary = "<script>&"
+	blocks := SlackBlocks(lead, qual, "deal_1")
+	header := blocks[0]["text"].(map[string]any)["text"].(string)
+	summary := blocks[1]["text"].(map[string]any)["text"].(string)
+	fields := blocks[2]["fields"].([]map[string]any)
+	if strings.Contains(header, "<Alex") || strings.Contains(summary, "<script>") || strings.Contains(fields[2]["text"].(string), "<Canadian>") {
+		t.Fatalf("unescaped Slack content: %#v", blocks)
+	}
+}
+
 func TestVerifySignature_OK(t *testing.T) {
 	secret := "shh"
 	body := []byte(`payload={"foo":"bar"}`)
@@ -93,5 +113,39 @@ func TestVerifySignature_Replay(t *testing.T) {
 	sig := "v0=" + hex.EncodeToString(mac.Sum(nil))
 	if VerifySignature(secret, ts, sig, body) {
 		t.Fatal("old timestamp must fail (replay protection)")
+	}
+}
+
+func TestTelegramDispatch_IntakeCallbackForwardsChatAndAcknowledges(t *testing.T) {
+	var callbackBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottoken/answerCallbackQuery" {
+			t.Fatalf("unexpected Telegram method path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&callbackBody); err != nil {
+			t.Fatalf("decode callback acknowledgement: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	tg := NewTelegram("token", 0, slog.Default())
+	tg.apiBaseURL = server.URL
+	var gotChatID int64
+	var gotValue string
+	tg.dispatch(context.Background(), Update{CallbackQuery: &CallbackQuery{
+		ID:      "cb-1",
+		Data:    "intake:Yes, signed",
+		Message: &Message{Chat: Chat{ID: 42}},
+	}}, nil, nil, func(_ context.Context, chatID int64, value string) {
+		gotChatID, gotValue = chatID, value
+	})
+
+	if gotChatID != 42 || gotValue != "Yes, signed" {
+		t.Fatalf("intake callback = (%d, %q), want (42, %q)", gotChatID, gotValue, "Yes, signed")
+	}
+	if callbackBody["callback_query_id"] != "cb-1" || callbackBody["text"] != "Answer received" {
+		t.Fatalf("unexpected callback acknowledgement: %#v", callbackBody)
 	}
 }

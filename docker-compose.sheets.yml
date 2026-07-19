@@ -1,0 +1,9 @@
+# Optional overlay for Google Sheets. It keeps the service-account key outside
+# the image and mounts it read-only. Do not commit the key itself.
+#
+# SHEETS_SA_FILE=/absolute/path/to/sheets_sa.json \
+#   docker compose -f docker-compose.yml -f docker-compose.sheets.yml up -d
+services:
+  pipeline:
+    volumes:
+      - ${SHEETS_SA_FILE:?set SHEETS_SA_FILE to the service-account JSON path}:/run/secrets/sheets_sa.json:ro

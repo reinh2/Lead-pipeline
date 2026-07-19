@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
 
-.PHONY: up down dev test demo-lead demo-lead-hot logs
+.PHONY: up down dev fmt vet test test-race check compose-config demo-lead demo-lead-hot logs
 
 up:
 	$(COMPOSE) up -d --build
@@ -13,8 +13,25 @@ down:
 dev:
 	cd pipeline && go run ./cmd/pipeline
 
+fmt:
+	cd pipeline && gofmt -w $$(rg --files -g '*.go')
+
+vet:
+	cd pipeline && go vet ./...
+
 test:
 	cd pipeline && go test ./...
+
+test-race:
+	cd pipeline && go test -race ./...
+
+check:
+	cd pipeline && test -z "$$(gofmt -d $$(rg --files -g '*.go'))"
+	cd pipeline && go vet ./...
+	cd pipeline && go test -race ./...
+
+compose-config:
+	$(COMPOSE) config --quiet
 
 logs:
 	$(COMPOSE) logs -f pipeline

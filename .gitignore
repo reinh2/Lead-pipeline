@@ -1,8 +1,21 @@
 # Secrets — real API keys live here; never commit
 .env
+.env.*
+!.env.example
+
+# Service account credentials
+service-account*.json
+*service-account*.json
+*credentials*.json
 
 # Runtime lead data (may contain personal data once integrations are live)
 data/leads.csv
+data/*.csv
+
+# Local build and test artifacts
+pipeline/coverage.out
+pipeline/*.test
+coverage.out
 
 # OS / editor noise
 .DS_Store

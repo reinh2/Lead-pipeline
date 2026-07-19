@@ -35,6 +35,8 @@ type Lead struct {
 	JobOffer       string    `json:"job_offer,omitempty"` // "signed" | "interviewing" | "no" (telegram only)
 	Message        string    `json:"message,omitempty"`
 	GDPRConsent    bool      `json:"gdpr_consent"`
+	ConsentVersion string    `json:"consent_version,omitempty"`
+	ConsentedAt    time.Time `json:"consented_at,omitempty"`
 
 	// Only set when Source == telegram — used by autoreply to DM the user back.
 	TelegramChatID int64 `json:"telegram_chat_id,omitempty"`

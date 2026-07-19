@@ -43,19 +43,19 @@ var fewShots = []struct {
 }{
 	{
 		user: `name: Alex Chen | nationality: Canadian | service: full_relocation | move_date: 2026-09-01 | family_size: 3 | message: Signed offer with N26, start Sep 1. Need visa, apartment in Prenzlauer Berg, school for two kids.`,
-		ans: models.Qualification{Category: models.CategoryHot, Urgency: 5, Estimate: models.EstimateEUR{3750, 9000},
+		ans: models.Qualification{Category: models.CategoryHot, Urgency: 5, Estimate: models.EstimateEUR{Min: 3750, Max: 9000},
 			Summary: "Signed N26 offer, family of 3, Sept start — full package, call today.",
 			Reply:   "Hi Alex, great timing — for a family move like yours we usually scope between €3,750 and €9,000 depending on the school and neighbourhood. Can we jump on a 15-min call today?"},
 	},
 	{
 		user: `name: Jamie Doe | nationality: American | service: full_relocation | move_date: | family_size: 1 | message: Thinking about maybe moving to Berlin someday, just curious about costs.`,
-		ans: models.Qualification{Category: models.CategoryCold, Urgency: 2, Estimate: models.EstimateEUR{2500, 6000},
+		ans: models.Qualification{Category: models.CategoryCold, Urgency: 2, Estimate: models.EstimateEUR{Min: 2500, Max: 6000},
 			Summary: "Early research, no offer or date. Send checklist and nurture.",
 			Reply:   "Hi Jamie, happy to send our Berlin relocation checklist so you can plan ahead. Reply when you have a start date and we'll build a scope."},
 	},
 	{
 		user: `name: Priya Sharma | nationality: Indian | service: full_relocation | move_date: 2026-10-01 | family_size: 2 | message: Interviewing at two Berlin startups, likely offer next month. Wife will join.`,
-		ans: models.Qualification{Category: models.CategoryWarm, Urgency: 3, Estimate: models.EstimateEUR{2500, 6000},
+		ans: models.Qualification{Category: models.CategoryWarm, Urgency: 3, Estimate: models.EstimateEUR{Min: 2500, Max: 6000},
 			Summary: "Actively interviewing, likely offer in a month. Book scoping call.",
 			Reply:   "Hi Priya, thanks for the details — for a couple relocating together we usually land between €2,500 and €6,000. Want to book a free 15-min scoping call this week?"},
 	},

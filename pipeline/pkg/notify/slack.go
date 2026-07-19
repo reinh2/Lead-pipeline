@@ -12,9 +12,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/anker-relocation/pipeline/pkg/models"
+	"github.com/anker-relocation/pipeline/pkg/retry"
 )
 
 // Slack posts the same card to a channel via an incoming webhook and
@@ -49,7 +51,7 @@ func (s *Slack) Notify(ctx context.Context, l models.Lead, q models.Qualificatio
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("slack HTTP %d: %s", resp.StatusCode, string(data))
+		return &retry.HTTPStatusError{Status: resp.StatusCode, Body: truncateSlackResponse(data)}
 	}
 	return nil
 }
@@ -57,14 +59,16 @@ func (s *Slack) Notify(ctx context.Context, l models.Lead, q models.Qualificatio
 // SlackBlocks renders the standard new-lead card as Block Kit blocks. Exported
 // so tests can inspect the structure without a live webhook.
 func SlackBlocks(l models.Lead, q models.Qualification, dealID string) []map[string]any {
+	name := slackPlainText(l.Name)
+	summary := slackMrkdwn(q.Summary)
 	return []map[string]any{
 		{"type": "header",
-			"text": map[string]any{"type": "plain_text", "text": emojiFor(q.Category) + " " + string(q.Category) + " lead: " + l.Name}},
-		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": q.Summary}},
+			"text": map[string]any{"type": "plain_text", "text": emojiFor(q.Category) + " " + string(q.Category) + " lead: " + name}},
+		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": summary}},
 		{"type": "section", "fields": []map[string]any{
-			{"type": "mrkdwn", "text": "*Service:* " + string(l.Service)},
-			{"type": "mrkdwn", "text": "*Move date:* " + defaultIfEmpty(l.MoveDate, "not set")},
-			{"type": "mrkdwn", "text": "*Nationality:* " + l.Nationality},
+			{"type": "mrkdwn", "text": "*Service:* " + slackMrkdwn(string(l.Service))},
+			{"type": "mrkdwn", "text": "*Move date:* " + slackMrkdwn(defaultIfEmpty(l.MoveDate, "not set"))},
+			{"type": "mrkdwn", "text": "*Nationality:* " + slackMrkdwn(l.Nationality)},
 			{"type": "mrkdwn", "text": "*Family:* " + strconv.Itoa(l.FamilySize)},
 		}},
 		{"type": "section", "text": map[string]any{
@@ -76,6 +80,20 @@ func SlackBlocks(l models.Lead, q models.Qualification, dealID string) []map[str
 			{"type": "button", "style": "danger", "text": map[string]any{"type": "plain_text", "text": "🗑 Mark spam"}, "action_id": "spam", "value": dealID},
 		}},
 	}
+}
+
+func slackPlainText(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+func slackMrkdwn(s string) string { return slackPlainText(s) }
+
+func truncateSlackResponse(data []byte) string {
+	const max = 300
+	if len(data) > max {
+		return string(data[:max]) + "…"
+	}
+	return string(data)
 }
 
 // VerifySignature validates a Slack interactivity request per

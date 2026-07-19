@@ -291,9 +291,9 @@ HUBSPOT_TOKEN=pat-eu1-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
 - `make demo-lead-hot`.
 - В HubSpot → Contacts: появится Priya Sharma / Alex Chen с nationality/country.
 - Contacts → выбранный контакт → Deals: привязана сделка «Alex Chen — full_relocation» с amount = среднему из оценки AI (для hot — €6,375), стадия `qualifiedtobuy`.
-- Нажать в Telegram «Claim lead» — стадия переедет в `appointmentscheduled`, поле `hubspot_owner_id` заполнится юзернеймом менеджера. Нажать «Mark spam» — стадия `closedlost`, причина `spam`.
+- Нажать в Telegram «Claim lead» — стадия переедет в `appointmentscheduled`, поле `claimed_by` заполнится юзернеймом менеджера. Нажать «Mark spam» — стадия `closedlost`, причина `spam`.
 
-Дедупликация: сервис ищет контакт по email; если есть — обновляет, если нет — создаёт.
+Перед включением создайте custom properties: `lead_id`, `qualification`, `source`, `claimed_by` (для Deal) и `nationality`, `consent_version`, `consent_timestamp` (для Contact). Повторная доставка ищет Deal по `lead_id`, обновляет его и не создаёт дубль; Contact по-прежнему ищется по email.
 
 ### 4. Google Sheets (запасной CRM)
 
@@ -303,7 +303,7 @@ HUBSPOT_TOKEN=pat-eu1-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
 
 - Google Sheets → создать новую таблицу «Anker Leads».
 - Первая вкладка → переименовать в `Leads`.
-- Первая строка (шапка) — можно оставить пустой, сервис пишет `append`, не форматирует.
+- В первой строке создайте точную CSV-шапку: `lead_id, created_at, source, name, email, nationality, current_country, service, move_date, family_size, job_offer, message, gdpr_consent, consent_version, consented_at, category, urgency, estimate_min_eur, estimate_max_eur, summary, status`. Сервис проверяет её до первой записи.
 - Из URL достать spreadsheet id: `https://docs.google.com/spreadsheets/d/<ID>/edit`.
 
 **Шаг 2. Service account.**
@@ -326,15 +326,16 @@ SHEETS_SA_JSON=/run/secrets/sheets_sa.json
 SHEETS_TAB=Leads
 ```
 
-**Шаг 5. Подмонтировать ключ в контейнер.** Отредактируйте `docker-compose.yml`, добавьте в секцию `pipeline`:
+**Шаг 5. Подмонтировать ключ read-only.** Не меняйте основной compose-файл. Используйте готовый overlay:
 
-```yaml
-    volumes:
-      - ./data:/data
-      - ./secrets/sheets_sa.json:/run/secrets/sheets_sa.json:ro
+```bash
+SHEETS_SA_FILE="$PWD/secrets/sheets_sa.json" \
+  docker compose -f docker-compose.yml -f docker-compose.sheets.yml up -d
 ```
 
-**Шаг 6.** Перезапуск, логи: `crm: google_sheets`. `make demo-lead-hot` → в таблице появляется новая строка.
+В `.env` укажите `SHEETS_SA_JSON=/run/secrets/sheets_sa.json`.
+
+**Шаг 6.** Перезапуск, логи: `crm: google_sheets`. `make demo-lead-hot` → в таблице появляется новая строка. Sheets — append-only экспорт; изменение статуса хранится в CSV fallback.
 
 Важно: если задан и `HUBSPOT_TOKEN`, и `SHEETS_SPREADSHEET_ID` — приоритет у HubSpot. Sheets срабатывает только когда HubSpot не сконфигурирован.
 

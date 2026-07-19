@@ -1,5 +1,7 @@
 # Anker Relocation — конвейер обработки лидов
 
+[English overview](README.en.md)
+
 Автоматизация быстрого ответа на обращения для вымышленного берлинского релокейт-агентства, помогающего экспатам с визами, жильём и регистрацией по месту жительства (Anmeldung). У системы два входа — лендинг и Telegram-бот; далее лид квалифицируется AI, записывается в CRM и отправляется менеджеру с интерактивными кнопками.
 
 Проект целиком запускается в **демо-режиме без API-ключей**. Чтобы включить реальные интеграции, достаточно постепенно заполнить соответствующие переменные в `.env`.
@@ -8,13 +10,17 @@
 
 ```mermaid
 flowchart LR
-    A[Форма на лендинге] -->|POST /api/leads| Q[Очередь]
-    B[Анкета Telegram-бота] -->|внутренняя отправка| Q
+    A[Форма на лендинге] -->|POST /api/leads| D[CSV event log]
+    B[Анкета Telegram-бота] -->|внутренняя отправка| D
+    D --> Q[Ограниченная очередь]
     Q --> AI[AI-квалификатор<br/>OpenRouter или mock]
     AI --> CRM[CRM<br/>HubSpot / Sheets / CSV]
     AI --> N[Уведомление менеджеру<br/>Telegram / Slack]
     AI --> R[Автоответ<br/>Email или Telegram-бот]
     N -.callback.-> CRM
+    AI --> D
+    CRM -.ошибка / retry exhausted.-> D
+    N -.ошибка / retry exhausted.-> D
 ```
 
 Каждый этап выполняется в режиме best effort: ошибка на одном этапе не должна привести к потере лида. Лид сначала записывается в CSV, а затем обрабатывается асинхронно.
@@ -50,6 +56,55 @@ go run ./cmd/pipeline    # слушает :8081, использует ../data/le
 | SMTP-автоответ | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Исходящее письмо выводится в stdout |
 
 Настраивайте только те интеграции, ключи для которых уже есть: остальные компоненты должны продолжать работать в деградированном режиме.
+
+## Архитектурные решения и компромиссы
+
+| Решение | Почему подходит для demo | Production-замена / ограничение |
+|---|---|---|
+| CSV append-only event log | Лид fsync-записывается до HTTP `202`, его можно открыть без инфраструктуры | PostgreSQL с таблицами `leads`/`lead_events` и backup policy; CSV не подходит для конкурентного multi-instance поиска |
+| Буферизированная Go-очередь | Проста и ограничена по памяти; queue-full возвращает контролируемый `503` после записи в CSV | Postgres outbox + worker, SQS, NATS JetStream или Redis Streams для горизонтального масштаба |
+| Mock AI fallback | Демо работает без ключа OpenRouter | Мониторинг качества модели, ревью prompt и явные SLA/лимиты провайдера |
+| In-memory rate limiter | Защищает один экземпляр без Redis | Distributed rate limit и согласованная политика reverse proxy/WAF |
+| CSV dead-letter events | Видно, какой lead и интеграция нуждаются в повторной обработке | Отдельная retry-очередь, UI/replay command и алерты |
+
+### Путь одного лида
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant W as Web / Telegram
+    participant P as Pipeline
+    participant C as CSV fallback
+    participant X as External integrations
+
+    U->>W: Submit demo lead
+    W->>P: POST /api/leads or intake completion
+    P->>C: fsync raw lead event
+    P-->>W: 202 Accepted
+    P->>P: Queue + qualify
+    P->>C: qualification event
+    par Independent tasks
+        P->>X: CRM upsert (bounded retry)
+        P->>X: Manager notification (bounded retry)
+        P->>X: Customer auto-reply (bounded retry)
+    end
+    X-->>C: exhausted task → dead_letter event
+```
+
+## Что сделано для production-minded demo
+
+- Raw lead сохраняется до подтверждения API; актуальная qualification и dead-letter события остаются в fallback CSV.
+- HubSpot upsert ищет сделку по `lead_id`; очередь имеет лимит и graceful shutdown.
+- CORS, trusted proxy IP handling, body/field limits и согласие на обработку данных проверяются на сервере.
+- `/readyz`, `/metrics`, JSON logs, non-root pipeline container, resource limits и проверяемый backup/restore уже есть.
+- CI запускает форматирование, vet, race tests, Compose smoke test и Trivy config scan.
+
+## Известные ограничения
+
+- Это **demo case study**, не публичная CRM: без HTTPS, назначенного data controller и процесса удаления данных нельзя заявлять GDPR compliance.
+- Повторная доставка уведомления может дать дубль у провайдера, который не поддерживает idempotency key; событие при исчерпанных ретраях остаётся в CSV для ручной обработки.
+- Google Sheets — append-only экспорт, а не источник истины для статусов.
+- Публикация контейнерного образа, Alertmanager rules, видео/GIF и скриншоты безопасного демо ещё не подготовлены.
 
 ## Сценарий использования
 
@@ -87,3 +142,21 @@ cd pipeline && go test ./...
 Покрыты: разбор JSON от квалификатора и fallback при некорректном ответе, валидация формы и согласия на обработку данных, state machine Telegram-анкеты, построение карточек уведомлений, проверка подписи Slack и интерфейс CRM через mock.
 
 Подробное русскоязычное руководство по запуску и настройке находится в [USAGE.md](USAGE.md).
+
+## Наблюдаемость и восстановление
+
+- `GET /healthz` подтверждает, что HTTP-процесс работает.
+- `GET /readyz` дополнительно проверяет, что очередь принимает лиды и CSV fallback доступен для записи. Docker health check использует этот endpoint.
+- `GET /metrics` отдаёт Prometheus-метрики принятых и обработанных лидов, времени обработки, AI fallback, ошибок интеграций, очереди и автоответов. Не публикуйте порт `8081` напрямую в интернет.
+
+CSV event log — источник восстановления демо-сервиса. Создайте проверяемую копию:
+
+```bash
+./scripts/backup-csv.sh data/leads.csv backups
+```
+
+Восстановление намеренно требует явных путей к резервной копии и рабочему файлу:
+
+```bash
+./scripts/restore-csv.sh backups/leads-YYYYMMDDTHHMMSSZ.csv data/leads.csv
+```

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,10 +17,12 @@ import (
 	"github.com/anker-relocation/pipeline/pkg/autoreply"
 	"github.com/anker-relocation/pipeline/pkg/crm"
 	"github.com/anker-relocation/pipeline/pkg/logging"
+	"github.com/anker-relocation/pipeline/pkg/metrics"
 	"github.com/anker-relocation/pipeline/pkg/models"
 	"github.com/anker-relocation/pipeline/pkg/notify"
 	"github.com/anker-relocation/pipeline/pkg/qualifier"
 	"github.com/anker-relocation/pipeline/pkg/queue"
+	"github.com/anker-relocation/pipeline/pkg/retry"
 	"github.com/anker-relocation/pipeline/pkg/tgbot"
 )
 
@@ -35,22 +38,35 @@ type pipeline struct {
 	notifiers []notify.Notifier
 	tg        *notify.Telegram // may be nil
 	reply     *autoreply.Replier
+	taskWG    sync.WaitGroup
+	metrics   *metrics.Registry
 }
 
 func (p *pipeline) Accept(ctx context.Context, l models.Lead) error {
 	// 1. Never lose a lead — CSV first, everything else best-effort.
 	if err := p.csv.AppendRaw(l); err != nil {
 		p.log.Error("csv append raw failed", "lead_id", l.ID, "err", err)
+		return err
 	}
 	// 2. Fan the rest of the work to the worker queue and return immediately.
 	if !p.q.Submit(l) {
-		// Queue full — do the work inline so the lead still gets processed.
-		go p.process(context.Background(), l)
+		// The raw lead is already durable. Do not create an unbounded fallback
+		// goroutine; callers receive a controlled 503 and can retry later.
+		return api.ErrUnavailable
+	}
+	if p.metrics != nil {
+		p.metrics.LeadAccepted()
 	}
 	return nil
 }
 
 func (p *pipeline) process(ctx context.Context, l models.Lead) {
+	started := time.Now()
+	defer func() {
+		if p.metrics != nil {
+			p.metrics.LeadProcessed(time.Since(started))
+		}
+	}()
 	log := p.log.With("lead_id", l.ID, "source", l.Source)
 
 	// AI qualification.
@@ -58,37 +74,108 @@ func (p *pipeline) process(ctx context.Context, l models.Lead) {
 	q := p.qual.Qualify(qctx, l)
 	cancel()
 	log.Info("qualified", "category", q.Category, "urgency", q.Urgency, "fallback", q.Fallback)
+	if q.Fallback && p.metrics != nil {
+		p.metrics.AIFallback()
+	}
 
-	// CRM upsert (primary — falls back to CSV automatically since csv is always tried above).
+	// Persist the qualification in fallback storage even when the primary CRM is
+	// available or failing. This keeps a recoverable full history on disk.
 	dealID := l.ID
+	if _, err := p.csv.Upsert(ctx, l, q); err != nil {
+		log.Error("csv qualification append failed", "err", err)
+	}
 	if p.crm != nil && p.crm.Name() != "csv" {
-		if id, err := p.crm.Upsert(ctx, l, q); err != nil {
-			log.Warn("crm upsert failed, csv already has the record", "crm", p.crm.Name(), "err", err)
+		var id string
+		err := retry.Do(ctx, retry.DefaultPolicy, func(callCtx context.Context) error {
+			var upsertErr error
+			id, upsertErr = p.crm.Upsert(callCtx, l, q)
+			return upsertErr
+		})
+		if err != nil {
+			log.Warn("crm upsert failed, fallback has the record", "crm", p.crm.Name(), "err", err)
+			if p.metrics != nil {
+				p.metrics.IntegrationError(p.crm.Name())
+			}
+			p.recordDeadLetter(ctx, l, q, "crm:"+p.crm.Name(), err)
 		} else {
 			dealID = id
 		}
-	} else {
-		if _, err := p.csv.Upsert(ctx, l, q); err != nil {
-			log.Warn("csv upsert failed", "err", err)
-		}
 	}
 
-	// Notifications — every configured adapter, in parallel-ish. Failures
-	// logged and retried once each; never fatal.
+	// Manager notifications and customer replies are independent tasks. Each is
+	// retried only for transient failures and leaves a recoverable dead-letter
+	// event when the retry budget is exhausted.
 	for _, n := range p.notifiers {
+		p.taskWG.Add(1)
 		go func(nn notify.Notifier) {
-			if err := nn.Notify(ctx, l, q, dealID); err != nil {
-				log.Warn("notify failed, retrying once", "notifier", nn.Name(), "err", err)
-				time.Sleep(500 * time.Millisecond)
-				if err := nn.Notify(ctx, l, q, dealID); err != nil {
-					log.Error("notify retry failed", "notifier", nn.Name(), "err", err)
+			defer p.taskWG.Done()
+			err := retry.Do(ctx, retry.DefaultPolicy, func(callCtx context.Context) error {
+				return nn.Notify(callCtx, l, q, dealID)
+			})
+			if err != nil {
+				log.Error("notification failed after retries", "notifier", nn.Name(), "err", err)
+				if p.metrics != nil {
+					p.metrics.IntegrationError(nn.Name())
 				}
+				p.recordDeadLetter(ctx, l, q, "notify:"+nn.Name(), err)
 			}
 		}(n)
 	}
 
-	// Auto-reply to the customer.
-	p.reply.Reply(ctx, l, q)
+	// Auto-reply is deliberately not chained behind manager notification.
+	if p.reply != nil {
+		p.taskWG.Add(1)
+		go func() {
+			defer p.taskWG.Done()
+			err := retry.Do(ctx, retry.DefaultPolicy, func(callCtx context.Context) error {
+				return p.reply.Reply(callCtx, l, q)
+			})
+			if err != nil {
+				log.Error("autoreply failed after retries", "err", err)
+				if p.metrics != nil {
+					p.metrics.IntegrationError("autoreply")
+				}
+				p.recordDeadLetter(ctx, l, q, "autoreply", err)
+			} else if q.Reply != "" && p.metrics != nil {
+				p.metrics.AutoReplySent()
+			}
+		}()
+	}
+}
+
+func (p *pipeline) ready(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.q == nil || !p.q.Ready() {
+		return errors.New("lead queue is not accepting work")
+	}
+	if p.csv == nil {
+		return errors.New("CSV fallback is not configured")
+	}
+	return p.csv.Check()
+}
+
+func (p *pipeline) recordDeadLetter(ctx context.Context, l models.Lead, q models.Qualification, task string, cause error) {
+	if err := p.csv.RecordTaskFailure(ctx, l, q, task); err != nil {
+		p.log.Error("dead-letter event write failed", "lead_id", l.ID, "task", task, "cause", cause, "err", err)
+		return
+	}
+	p.log.Warn("dead-letter event recorded", "lead_id", l.ID, "task", task, "cause", cause)
+}
+
+func (p *pipeline) waitNotifications(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		p.taskWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func main() {
@@ -97,7 +184,12 @@ func main() {
 
 	port := envOr("PIPELINE_PORT", "8081")
 	csvPath := envOr("CSV_PATH", "../data/leads.csv")
-	origins := splitCSV(envOr("CORS_ORIGINS", "*"))
+	origins := splitCSV(os.Getenv("CORS_ORIGINS"))
+	trustedProxies, err := api.ParseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		log.Error("invalid trusted proxy CIDRs", "err", err)
+		os.Exit(1)
+	}
 
 	// --- CSV is always available ---------------------------------------------
 	csvSink, err := crm.NewCSV(csvPath)
@@ -184,13 +276,15 @@ func main() {
 		tg:        tg,
 		reply:     rep,
 	}
+	p.metrics = metrics.New(p.q.Len)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
-	p.q.Run(ctx, p.process)
+	p.q.Run(p.process)
 
 	// --- Telegram poll loop (intake + callbacks) -----------------------------
 	if tg != nil {
 		bot := tgbot.New(tg, p, log)
+		go bot.RunCleanup(ctx)
 		go tg.Poll(ctx,
 			func(cbCtx context.Context, action notify.CallbackAction, dealID, manager string) {
 				log.Info("manager callback", "action", action, "deal", dealID, "manager", manager)
@@ -212,13 +306,18 @@ func main() {
 				}
 			},
 			bot.Handle,
+			bot.HandleCallback,
 		)
 	}
 
 	// --- HTTP server ---------------------------------------------------------
+	apiServer := api.NewWithTrustedProxies(log, p, origins, trustedProxies)
+	apiServer.Ready = p.ready
+	apiServer.Metrics = p.metrics.WritePrometheus
+	apiServer.TelegramBotUsername = os.Getenv("TELEGRAM_BOT_USERNAME")
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           api.New(log, p, origins).Routes(),
+		Handler:           apiServer.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -231,10 +330,16 @@ func main() {
 
 	<-ctx.Done()
 	log.Info("shutting down")
-	shCtx, shCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shCtx, shCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer shCancel()
 	_ = srv.Shutdown(shCtx)
-	p.q.Wait()
+	p.q.Close()
+	if err := p.q.Wait(shCtx); err != nil {
+		log.Warn("queue drain incomplete", "err", err)
+	}
+	if err := p.waitNotifications(shCtx); err != nil {
+		log.Warn("notification drain incomplete", "err", err)
+	}
 }
 
 func envOr(k, d string) string {

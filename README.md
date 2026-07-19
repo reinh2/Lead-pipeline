@@ -1,180 +1,115 @@
-# Anker Relocation — конвейер обработки лидов
+# Anker Relocation — AI Lead Pipeline (Demo Case Study)
 
-[English overview](README.en.md)
+[Русская версия](README.ru.md) · [Architecture deep-dive](ARCHITECTURE.md) · [Setup guide, RU](USAGE.md)
 
-Автоматизация быстрого ответа на обращения для вымышленного берлинского релокейт-агентства, помогающего экспатам с визами, жильём и регистрацией по месту жительства (Anmeldung). У системы два входа — лендинг и Telegram-бот; далее лид квалифицируется AI, записывается в CRM и отправляется менеджеру с интерактивными кнопками.
+**An enquiry answered in ~30 seconds instead of 4 hours.** A complete, runnable lead-processing system built around a fictional Berlin relocation agency: a landing page and a Telegram bot capture leads, AI qualifies each one, the CRM gets a record, the manager gets a one-tap action card, and the customer gets an instant personal reply.
 
-Проект целиком запускается в **демо-режиме без API-ключей**. Чтобы включить реальные интеграции, достаточно постепенно заполнить соответствующие переменные в `.env`.
+![Landing page of the demo relocation agency](docs/screenshots/landing-hero.jpg)
 
-## Статус релиза
+## The problem it solves
 
-**v0.1.0 · release-ready demo.** Локально проверяются `make release-check`, Docker Compose и полный Go test suite с race detector. Это портфолио-проект, а не готовый публичный сервис: перед реальным запуском обязательно настройте HTTPS, хранение/удаление персональных данных и перевыпустите любые ключи, попавшие в логи.
+Service businesses lose deals in the gap between *"enquiry sent"* and *"manager replied"*. Enquiries arrive at night and on weekends, a large share of them are spam or early-stage browsing, and by the time someone answers the good ones, the customer has already booked a call with a competitor.
 
-## Конвейер
+This pipeline closes that gap:
 
-```mermaid
-flowchart LR
-    A[Форма на лендинге] -->|POST /api/leads| D[CSV event log]
-    B[Анкета Telegram-бота] -->|внутренняя отправка| D
-    D --> Q[Ограниченная очередь]
-    Q --> AI[AI-квалификатор<br/>OpenRouter или mock]
-    AI --> CRM[CRM<br/>HubSpot / Sheets / CSV]
-    AI --> N[Уведомление менеджеру<br/>Telegram / Slack]
-    AI --> R[Автоответ<br/>Email или Telegram-бот]
-    N -.callback.-> CRM
-    AI --> D
-    CRM -.ошибка / retry exhausted.-> D
-    N -.ошибка / retry exhausted.-> D
+- **Reply in seconds, not hours.** The customer gets a personalized answer with a realistic price range the moment they submit — by email or Telegram.
+- **Sales sees only leads worth calling.** AI marks each enquiry *hot / warm / cold / spam* with an urgency score, so nobody wastes mornings triaging a shared inbox.
+- **Nothing gets lost.** Every lead is written to durable storage *before* the website even confirms receipt. If the CRM, the AI provider, or Telegram is down, the lead survives and the failure is recorded for replay.
+
+> Target scenario: median first response **4 hours → 30 seconds**; ~40% of enquiries auto-flagged as spam or not-ready so the sales team never sees them. Personal data is processed only after explicit consent, enforced server-side.
+
+## What happens to one lead
+
+1. A visitor submits the form (or completes the Telegram bot intake):
+
+![Lead form filled with a demo enquiry](docs/screenshots/landing-form.jpg)
+
+2. The lead is fsync-ed to an append-only event log, the visitor sees "received" — everything after this point is asynchronous and retried.
+
+3. AI (OpenRouter, with a deterministic keyword fallback) classifies it. Real log from this exact demo lead:
+
+```json
+{"level":"INFO","msg":"qualified","lead_id":"ld_3a0f62e2a21bed7d","source":"web","category":"hot","urgency":5,"fallback":false}
 ```
 
-Каждый этап выполняется в режиме best effort: ошибка на одном этапе не должна привести к потере лида. Лид сначала записывается в CSV, а затем обрабатывается асинхронно.
+4. The manager's Telegram (or Slack) gets a card with one-tap actions — **Claim** and **Mark spam** update the CRM without opening it:
 
-## Быстрый старт за 5 минут
+```
+🔥  Hot new lead: Alex Chen (Canadian)
+    Service: full_relocation
+    Move date: 2026-09-01
+    Family size: 3
+    Source: web
+    Summary: Signed job offer or concrete relocation timeline — call within the hour.
+    Estimate: €3,750 – €9,000
+
+    [ ✅ Claim ]   [ 🗑 Mark spam ]   [ 💬 Contact ]
+```
+
+5. The CRM (HubSpot or Google Sheets) receives the deal with the same estimate and summary.
+
+6. The customer gets an instant reply matched to their situation:
+
+> Hi Alex, thanks for reaching out — this looks like exactly what we handle every week. For your situation the full package usually lands between €3,750 and €9,000. I can hop on a 15-minute call today; what timezone are you in?
+
+## Run it yourself in 5 minutes
+
+No API keys required — without them the pipeline uses a mock qualifier, CSV storage and stdout notifications, so the whole flow is visible locally:
 
 ```bash
 cd lead-pipeline
 cp .env.example .env
-make up             # docker compose: лендинг (nginx :8080) + pipeline (:8081)
-make demo-lead      # отправить реалистичный тестовый лид с лендинга
-make demo-lead-hot  # лид с подписанным оффером и переездом через 6 недель
+make up             # docker compose: landing on :8080, pipeline on :8081
+make demo-lead      # submit a realistic test lead
+make demo-lead-hot  # a lead with a signed offer moving in 6 weeks
 ```
 
-Если `data/leads.csv` уже был создан предыдущей версией demo, сервис сам
-мигрирует известную старую схему при запуске. Оригинал остаётся рядом как
-`data/leads.csv.pre-consent-migration-<timestamp>.bak`; не удаляйте его до
-проверки результата. Неизвестную или повреждённую схему сервис не угадывает и
-останавливается с явной ошибкой, чтобы не испортить данные.
+Open <http://localhost:8080>, submit the form, and watch `docker compose logs -f pipeline` show the qualification verdict, the CRM write and the manager card. Use fictional data only.
 
-Затем откройте [http://localhost:8080](http://localhost:8080) и отправьте форму. В `docker compose logs -f pipeline` будут видны вердикт квалификатора, запись в `data/leads.csv` и карточка уведомления, выведенная в stdout.
+## Integrations
 
-Запуск для разработки без Docker:
+Each integration switches on when its keys appear in `.env`; everything else keeps working without it.
 
-```bash
-cd pipeline
-go run ./cmd/pipeline    # слушает :8081, использует ../data/leads.csv
-```
-
-## Интеграции
-
-| Интеграция | Переменные окружения | Поведение без настройки |
+| Integration | What it gives you | Without keys |
 |---|---|---|
-| OpenRouter (AI-квалификация) | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Используется mock-квалификатор по ключевым словам |
-| HubSpot CRM | `HUBSPOT_TOKEN` | Используются Google Sheets, если они настроены; иначе CSV |
-| Google Sheets CRM | `SHEETS_WEBHOOK_URL`, `SHEETS_WEBHOOK_SECRET` | Используется CSV |
-| Telegram-бот и уведомления менеджеру | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_MANAGER_CHAT_ID` | Уведомления выводятся в stdout, бот выключен |
-| Slack | `SLACK_WEBHOOK_URL`, `SLACK_SIGNING_SECRET` | Slack-адаптер не регистрируется |
-| SMTP-автоответ | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Исходящее письмо выводится в stdout |
+| OpenRouter (any LLM) | Real AI qualification and reply drafting | Keyword-based mock qualifier |
+| HubSpot | Deals created/updated in your sales pipeline | Google Sheets, then CSV |
+| Google Sheets | A lightweight CRM your team already knows | CSV event log |
+| Telegram | Intake bot + manager cards with Claim/Spam buttons | Cards printed to logs |
+| Slack | Manager notifications in a channel | — |
+| SMTP | Instant auto-reply emails to customers | Reply printed to logs |
 
-Настраивайте только те интеграции, ключи для которых уже есть: остальные компоненты должны продолжать работать в деградированном режиме.
+## The boring parts, done right
 
-## Архитектурные решения и компромиссы
+The demo is small, but it is built the way production systems are:
 
-| Решение | Почему подходит для demo | Production-замена / ограничение |
-|---|---|---|
-| CSV append-only event log | Лид fsync-записывается до HTTP `202`, его можно открыть без инфраструктуры | PostgreSQL с таблицами `leads`/`lead_events` и backup policy; CSV не подходит для конкурентного multi-instance поиска |
-| Буферизированная Go-очередь | Проста и ограничена по памяти; queue-full возвращает контролируемый `503` после записи в CSV | Postgres outbox + worker, SQS, NATS JetStream или Redis Streams для горизонтального масштаба |
-| Mock AI fallback | Демо работает без ключа OpenRouter | Мониторинг качества модели, ревью prompt и явные SLA/лимиты провайдера |
-| In-memory rate limiter | Защищает один экземпляр без Redis | Distributed rate limit и согласованная политика reverse proxy/WAF |
-| CSV dead-letter events | Видно, какой lead и интеграция нуждаются в повторной обработке | Отдельная retry-очередь, UI/replay command и алерты |
+- Write-ahead event log: a lead is on disk before the HTTP 202; CRM/notify/reply failures leave replayable dead-letter events.
+- Bounded queue with backpressure (a controlled 503 instead of silent loss), graceful shutdown that drains in-flight work.
+- Server-side validation, GDPR-consent enforcement, rate limiting, CORS and trusted-proxy handling.
+- `/healthz`, `/readyz`, Prometheus `/metrics`, JSON logs, non-root container, CI with race-detector tests, a Docker Compose smoke test and a config vulnerability scan.
+- Automatic migration of older on-disk data schemas, with timestamped backups and verifiable backup/restore scripts.
 
-### Путь одного лида
+Details, diagrams and trade-offs: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant W as Web / Telegram
-    participant P as Pipeline
-    participant C as CSV fallback
-    participant X as External integrations
+## Adapt it to your business
 
-    U->>W: Submit demo lead
-    W->>P: POST /api/leads or intake completion
-    P->>C: fsync raw lead event
-    P-->>W: 202 Accepted
-    P->>P: Queue + qualify
-    P->>C: qualification event
-    par Independent tasks
-        P->>X: CRM upsert (bounded retry)
-        P->>X: Manager notification (bounded retry)
-        P->>X: Customer auto-reply (bounded retry)
-    end
-    X-->>C: exhausted task → dead_letter event
-```
+Relocation is just the example scenario. The same pipeline fits any business that lives on inbound enquiries — dental and medical clinics, real-estate and rental agencies, auto services, legal and immigration consultants, B2B services. What changes is the form fields, the qualification prompt and the reply templates; the reliability core stays the same. The AI provider, CRM and notification channels are pluggable adapters.
 
-## Что сделано для production-minded demo
+## Honest limitations
 
-- Raw lead сохраняется до подтверждения API; актуальная qualification и dead-letter события остаются в fallback CSV.
-- HubSpot upsert ищет сделку по `lead_id`; очередь имеет лимит и graceful shutdown.
-- CORS, trusted proxy IP handling, body/field limits и согласие на обработку данных проверяются на сервере.
-- `/readyz`, `/metrics`, JSON logs, non-root pipeline container, resource limits и проверяемый backup/restore уже есть.
-- CI запускает форматирование, vet, race tests, Compose smoke test и Trivy config scan.
-- CI также запускает demo поверх CSV предыдущей схемы, поэтому обновление
-  event log не ломает уже существующую локальную установку.
+This is a **demo case study**, not a hosted product:
 
-## Известные ограничения
+- The company, testimonials, prices and metrics on the landing are clearly labeled fictional; the response-time numbers above are the target scenario, not production measurements.
+- Not GDPR-compliant as-is: a real deployment needs HTTPS, a named data controller, retention/deletion workflows.
+- Google Sheets is a lightweight single-instance CRM, not a multi-user CRM replacement; some notification providers may deliver duplicates on retry.
+- A demo video is planned; screenshots above are from the running demo.
 
-- Это **demo case study**, не публичная CRM: без HTTPS, назначенного data controller и процесса удаления данных нельзя заявлять GDPR compliance.
-- Повторная доставка уведомления может дать дубль у провайдера, который не поддерживает idempotency key; событие при исчерпанных ретраях остаётся в CSV для ручной обработки.
-- Google Sheets — лёгкая CRM для одного процесса/экземпляра, а не замена полноценной multi-user CRM с правами, воронкой и аудитом изменений. CSV всё равно хранит резервную историю событий.
-- Публикация контейнерного образа, Alertmanager rules, видео/GIF и скриншоты безопасного демо ещё не подготовлены.
+## Tech stack
 
-## Сценарий использования
-
-> «Медианное время первого ответа: 4 часа → 30 секунд. 40% обращений автоматически помечаются как неготовые к покупке или спам, поэтому отдел продаж видит только лиды, с которыми стоит связаться. Обработка данных возможна только после согласия пользователя».
-
-## Структура проекта
-
-```
-lead-pipeline/
-├── landing/                # статический HTML-лендинг + Tailwind CDN
-├── pipeline/               # Go-сервис
-│   ├── cmd/pipeline/       # точка входа
-│   └── pkg/
-│       ├── api/            # HTTP, rate limit и валидация
-│       ├── autoreply/      # email- или Telegram-автоответ
-│       ├── crm/            # HubSpot / Sheets / CSV
-│       ├── logging/        # вспомогательные функции slog
-│       ├── models/         # Lead и Qualification
-│       ├── notify/         # адаптеры Telegram и Slack
-│       ├── qualifier/      # OpenRouter и mock-квалификатор
-│       ├── queue/          # внутренняя очередь с воркером
-│       └── tgbot/          # анкета в Telegram через long polling
-├── data/                   # резервный CSV с лидами
-├── docker-compose.yml
-├── Makefile
-└── .env.example
-```
-
-## Тесты
+Go 1.22 (standard library only — `net/http`, `slog`, no frameworks) · static HTML/CSS/JS landing · nginx · Docker Compose · OpenRouter · HubSpot & Google Sheets & Telegram Bot APIs · GitHub Actions CI.
 
 ```bash
-cd pipeline && go test ./...
+cd pipeline && go test ./...   # race-detector tests run in CI on every push
 ```
 
-Перед публикацией или обновлением используйте:
-
-```bash
-make release-check
-```
-
-Покрыты: разбор JSON от квалификатора и fallback при некорректном ответе, валидация формы и согласия на обработку данных, state machine Telegram-анкеты, построение карточек уведомлений, проверка подписи Slack и интерфейс CRM через mock.
-
-Подробное русскоязычное руководство по запуску и настройке находится в [USAGE.md](USAGE.md).
-
-## Наблюдаемость и восстановление
-
-- `GET /healthz` подтверждает, что HTTP-процесс работает.
-- `GET /readyz` дополнительно проверяет, что очередь принимает лиды и CSV fallback доступен для записи. Docker health check использует этот endpoint.
-- `GET /metrics` отдаёт Prometheus-метрики принятых и обработанных лидов, времени обработки, AI fallback, ошибок интеграций, очереди и автоответов. Не публикуйте порт `8081` напрямую в интернет.
-
-CSV event log — источник восстановления демо-сервиса. Создайте проверяемую копию:
-
-```bash
-./scripts/backup-csv.sh data/leads.csv backups
-```
-
-Восстановление намеренно требует явных путей к резервной копии и рабочему файлу:
-
-```bash
-./scripts/restore-csv.sh backups/leads-YYYYMMDDTHHMMSSZ.csv data/leads.csv
-```
+Project layout, diagrams and design decisions: [ARCHITECTURE.md](ARCHITECTURE.md). Russian-language setup and configuration guide: [USAGE.md](USAGE.md). Roadmap: [ROADMAP.md](ROADMAP.md).

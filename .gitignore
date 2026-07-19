@@ -11,6 +11,9 @@ service-account*.json
 # Runtime lead data (may contain personal data once integrations are live)
 data/leads.csv
 data/*.csv
+# Automatic backups created by the CSV schema migration. Keep them local:
+# they may contain the same personal data as the active event log.
+data/*.bak
 
 # Local build and test artifacts
 pipeline/coverage.out

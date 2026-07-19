@@ -35,6 +35,12 @@ make demo-lead      # отправить реалистичный тестовы
 make demo-lead-hot  # лид с подписанным оффером и переездом через 6 недель
 ```
 
+Если `data/leads.csv` уже был создан предыдущей версией demo, сервис сам
+мигрирует известную старую схему при запуске. Оригинал остаётся рядом как
+`data/leads.csv.pre-consent-migration-<timestamp>.bak`; не удаляйте его до
+проверки результата. Неизвестную или повреждённую схему сервис не угадывает и
+останавливается с явной ошибкой, чтобы не испортить данные.
+
 Затем откройте [http://localhost:8080](http://localhost:8080) и отправьте форму. В `docker compose logs -f pipeline` будут видны вердикт квалификатора, запись в `data/leads.csv` и карточка уведомления, выведенная в stdout.
 
 Запуск для разработки без Docker:
@@ -98,6 +104,8 @@ sequenceDiagram
 - CORS, trusted proxy IP handling, body/field limits и согласие на обработку данных проверяются на сервере.
 - `/readyz`, `/metrics`, JSON logs, non-root pipeline container, resource limits и проверяемый backup/restore уже есть.
 - CI запускает форматирование, vet, race tests, Compose smoke test и Trivy config scan.
+- CI также запускает demo поверх CSV предыдущей схемы, поэтому обновление
+  event log не ломает уже существующую локальную установку.
 
 ## Известные ограничения
 

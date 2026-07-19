@@ -17,7 +17,7 @@
 | CRM | HubSpot REST API, Google Sheets API через Service Account, CSV как резервное хранилище |
 | Уведомления | Telegram Bot API, Slack Incoming Webhook |
 | Автоответ | Telegram DM или SMTP (`net/smtp`) |
-| Frontend | Статический HTML, Tailwind CSS через CDN, JavaScript без фреймворка |
+| Frontend | Статический HTML, CSS и JavaScript без фреймворка |
 | Reverse proxy | Nginx |
 | Контейнеризация | Docker, Docker Compose |
 | Тесты | Стандартный пакет `testing`, unit-тесты Go |
@@ -64,7 +64,8 @@ go test -race ./...
 go vet ./...
 ```
 
-> Сейчас `go vet ./...` завершится с тремя предупреждениями о неименованных полях `EstimateEUR`; это первый небольшой пункт roadmap.
+> `go vet ./...` проходит без предупреждений. Базовые проверки из этапа 0 уже
+> включены в `make check` и CI.
 
 ## Принципы реализации
 

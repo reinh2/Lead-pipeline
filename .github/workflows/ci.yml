@@ -26,6 +26,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - run: make compose-config
+      - name: Seed a legacy event log to verify in-place migration
+        run: |
+          mkdir -p data
+          printf '%s\n' \
+            'lead_id,created_at,source,name,email,nationality,current_country,service,move_date,family_size,job_offer,message,gdpr_consent,category,urgency,estimate_min_eur,estimate_max_eur,summary,status' \
+            'ld_legacy,2026-07-18T23:42:56Z,web,Legacy Lead,legacy@example.test,Canadian,Canada,full_relocation,2026-10-01,2,,Legacy migration smoke test.,true,2026-07-19,2026-07-18T23:42:56Z,warm,3,2500,6000,Needs review.,warm' \
+            > data/leads.csv
       - run: docker compose up --build -d
       - name: Check landing, readiness and durable lead write
         run: |
@@ -35,6 +42,8 @@ jobs:
           done
           curl --fail --silent http://localhost:8081/readyz >/dev/null
           curl --fail --silent http://localhost:8080/ >/dev/null
+          grep 'consent_version' data/leads.csv
+          grep 'legacy@example.test' data/leads.csv
           curl --fail --silent --show-error -X POST http://localhost:8081/api/leads \
             -H 'Content-Type: application/json' \
             --data '{"name":"Demo Lead","email":"demo@example.com","nationality":"Canadian","current_country":"Canada","service":"full_relocation","family_size":1,"message":"CI smoke test","gdpr_consent":true}' \

@@ -47,11 +47,13 @@ jobs:
           curl --fail --silent http://localhost:8080/ >/dev/null
           grep 'consent_version' data/leads.csv
           grep 'legacy@example.test' data/leads.csv
+          # The API rejects move dates in the past, so the smoke lead always moves a year from today.
+          payload=$(printf '{"name":"Demo Lead","email":"demo@example.com","nationality":"Canadian","current_country":"Canada","service":"full_relocation","move_date":"%s","family_size":1,"message":"CI smoke test","gdpr_consent":true}' "$(date -u -d '+1 year' +%F)")
           submitted=false
           for attempt in {1..5}; do
             if curl --fail --silent --show-error -X POST http://localhost:8081/api/leads \
               -H 'Content-Type: application/json' \
-              --data '{"name":"Demo Lead","email":"demo@example.com","nationality":"Canadian","current_country":"Canada","service":"full_relocation","move_date":"2026-10-01","family_size":1,"message":"CI smoke test","gdpr_consent":true}' \
+              --data "$payload" \
               | grep '"ok":true'; then submitted=true; break; fi
             sleep 2
           done

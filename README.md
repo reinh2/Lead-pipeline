@@ -6,6 +6,12 @@
 
 ![Landing page of the demo relocation agency](docs/screenshots/landing-hero.jpg)
 
+## Video overview
+
+[![Lead Pipeline video overview: the enquiry form, AI qualification and the manager card in Telegram](https://reinh2.github.io/assets/motion/lead-en-poster.webp)](https://reinh2.github.io/assets/motion/lead-en.mp4)
+
+▶ **[Watch the 32-second overview](https://reinh2.github.io/assets/motion/lead-en.mp4)** (with sound) · [Russian version](https://reinh2.github.io/assets/motion/lead-ru.mp4) · [Portfolio](https://reinh2.github.io/en/#lead)
+
 ## The problem it solves
 
 Service businesses lose deals in the gap between *"enquiry sent"* and *"manager replied"*. Enquiries arrive at night and on weekends, a large share of them are spam or early-stage browsing, and by the time someone answers the good ones, the customer has already booked a call with a competitor.

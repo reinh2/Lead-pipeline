@@ -6,6 +6,12 @@
 
 ![Лендинг демо-агентства](docs/screenshots/landing-hero.jpg)
 
+## Видеообзор
+
+[![Видеообзор Lead Pipeline: форма заявки, оценка заявки и карточка менеджера в Telegram](https://reinh2.github.io/assets/motion/lead-ru-poster.webp)](https://reinh2.github.io/assets/motion/lead-ru.mp4)
+
+▶ **[Смотреть обзор, 32 секунды](https://reinh2.github.io/assets/motion/lead-ru.mp4)** (со звуком) · [English version](https://reinh2.github.io/assets/motion/lead-en.mp4) · [Портфолио](https://reinh2.github.io/#lead)
+
 ## Какую проблему это решает
 
 Бизнес в сфере услуг теряет сделки в промежутке между «заявка отправлена» и «менеджер ответил». Заявки приходят ночью и в выходные, заметная часть — спам или «просто интересуюсь», а пока менеджер добирается до хороших, клиент уже записался на звонок к конкуренту.
